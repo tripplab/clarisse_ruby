@@ -1,6 +1,11 @@
 #!/usr/bin/env ruby
-# Copyright 2014 Victor Villa
+
+# Dr. Mauricio Carrillo-Tripp
+# Biomolecular Diversity Laboratory
+# tripplab.com
 #
+# Copyright 2014 Victor Villa
+
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or

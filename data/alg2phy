@@ -1,0 +1,53 @@
+#!/usr/bin/env ruby
+
+if not ARGV[0]
+  abort "No input file was received"
+end
+
+if not File.exists? ARGV[0]
+  abort "Could not find file #{ARGV[0]}"
+end
+
+target = ARGV[1] || "#{File.basename(ARGV[0], File.extname(ARGV[0]))}.phy"
+
+if File.exists? target
+  abort "There is already a file #{target}."
+end
+
+start_of_sequence = /^>/
+fig = /(?<=_)\d+$/
+
+# Let's read the file and count the '>' characters
+n_sequences = 0
+File.open(ARGV.first, "r") do |file|
+  file.each_line do |line|
+    n_sequences += 1 if line.match start_of_sequence
+  end
+end
+
+# Let's count the alignment lenght by choosing the first
+# sequence, joining all of its lines and checking the lenght
+# of the resulting string
+counting = false
+sequence = ""
+File.open(ARGV.first, "r") do |file|
+  file.each_line do |line|
+    if counting
+      break if line.match start_of_sequence
+      sequence += line.strip
+    else
+      counting = true if line.match start_of_sequence
+    end
+  end
+end
+
+align_length = sequence.length
+
+File.open(target, "w") do |out|
+  out.puts "#{n_sequences}\t#{align_length}"
+  File.open(ARGV.first, "r") do |original|
+    original.each_line do |line|
+      out.puts line
+    end
+  end
+end

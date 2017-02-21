@@ -1,0 +1,10 @@
+1:
+  outfile: 1.out
+  lnL: true
+  omega: true
+  w_ratios: true
+2:
+  outfile: 2.out
+  lnL: true
+  omega: true
+  w_ratios: true

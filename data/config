@@ -1,0 +1,18 @@
+1:
+  seqfile: seq.phy
+  treefile: tree.nwk
+  kappa: 0
+  fix_kappa: 0
+  omega: 0
+  fix_omega: 0
+  model: 0
+  outfile: 1.out
+2:
+  seqfile: seq.phy
+  treefile: tree.nwk
+  fix_kappa: 0
+  kappa: =1|kappa
+  omega: 0
+  fix_omega: 0
+  model: 0
+  outfile: 2.out

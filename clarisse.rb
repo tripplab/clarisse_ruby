@@ -33,7 +33,7 @@ class ExecError < StandardError; end
 
 @mutex = Mutex.new
 
-PROGRAM_VERSION = "1.2.0"
+PROGRAM_VERSION = "1.3.0"
 
 RIGHT_ALIGNMENT = 13
 CONTROL_EXT = "control"

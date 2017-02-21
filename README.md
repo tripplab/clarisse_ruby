@@ -13,9 +13,9 @@ Use the --help option to display possible parameters
 
 Configuration file format
 --------------------------------------------------
-TODO
+See the [wiki] (https://github.com/tripplab/clarisse_ruby/wiki)
 
 Results configuration file format
 --------------------------------------------------
-TODO
+See the [wiki] (https://github.com/tripplab/clarisse_ruby/wiki)
 

@@ -1,6 +1,4 @@
-# clarisse_ruby
-
-Clarisse: a wrapper for automatic codeml execution
+# Clarisse: a wrapper for automatic codeml execution
 ==================================================
 Clarisse is a script that automates the execution of codeml over a number of directories. It can copy or generate the necessary control files and then use them to execute codeml. It has three execution modes that define the control file to be used:
 - Copying a source control file to every directory. This is specified with the option --control

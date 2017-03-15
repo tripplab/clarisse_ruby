@@ -21,20 +21,20 @@
 
 require 'optparse'
 require 'pathname'
-#require 'pp'
+require 'pp'
 require 'fileutils'
 require 'json'
 require 'yaml'
 
 
-PROGRAM_VERSION       = "1.3.0"
+PROGRAM_VERSION       = "2.0.0"
 
 CONFIG_FILE_MARKER    = "="
-CONFIG_FILE_SEPARATOR = "|"
+CONFIG_FILE_SEPARATOR = "->"
 CONFIG_FILE_POINTERS  = ["seqfile", "treefile"]
 
-CONTROL_FILE_START    = " * Clarisse: start of dynamically generated options"
-CONTROL_FILE_END      = " * Clarisse: end of dynamically generated options"
+CONTROL_FILE_START    = " *** START OF DYNAMICALLY GENERATED OPTIONS ***"
+CONTROL_FILE_END      = " *** END OF DYNAMICALLY GENERATED OPTIONS ***"
 CONTROL_FILE_ALIGN    = 13
 
 FILE_COMMON_PREFIX    = "_clarisse_"
@@ -48,6 +48,10 @@ COLUMN_ITERATION_TITLE  = "Iteration"
 COLUMN_ITERATION_WIDTH  = COLUMN_ITERATION_TITLE.length
 COLUMN_TIME_TITLE       = "Running time (iteration/alignment)"
 COLUMN_TIME_WIDTH       = COLUMN_TIME_TITLE.length
+COLUMN_QUEUE_TITLE      = "Thread"
+COLUMN_QUEUE_WIDTH      = COLUMN_QUEUE_TITLE.length
+COLUMN_DIRS_TITLE       = "Alignments"
+COLUMN_DIRS_WIDTH       = COLUMN_DIRS_TITLE.length
 
 COLUMN_EVENT_TITLE      = "Status"
 COLUMN_EVENT_START      = "Started"
@@ -60,147 +64,542 @@ COLUMN_EVENT_WIDTH      = [
   COLUMN_EVENT_TITLE
 ].max_by(&:length).length
 
-#class ExecError < StandardError; end
-#CODEML_ERRORS = /(Error:|Sequence.*?not found|Species.*?\?)/
+REGEX_EXTRACTION  = /^#{CONFIG_FILE_MARKER}\s*(?<iter>[[:digit:]]+)\s*#{CONFIG_FILE_SEPARATOR}\s*(?<key>[[:alnum:]]+)\s*$/
 
-### REGEX/FILTERS [[[
+# TODO: Add better descriptions
+HELP_SHORT = <<-EOF
+Clarisse is a script that automates the execution of codeml over a number of directories. It can copy or generate the necessary control files and then use them to execute codeml.
+EOF
 
-#FILE_RESULTS_NAME   = FILE_COMMON_PREFIX + "results.csv"
-#NOT_FOUND = "N/F"
-#RESULTS_FILE_KEY = "outfile"
-#RESULTS_VALID_OPTIONS = [RESULTS_FILE_KEY, "lnL", "omega", "w_ratios"]
-#FLOAT     = /[+-]?[0-9.]+/
-#LNL       = /(?<=ntime:)\s*(#{FLOAT}).*(?<=np:)\s*(#{FLOAT}).*?(#{FLOAT}).*?#{FLOAT}$/
-#OMEGA     = /(#{FLOAT})$/
-#W_RATIOS  = /w ratios as labels for TreeView:/
-### ]]]
+HELP_LONG = <<-EOF
+Control files will be created dynamically...
+
+EXPANSION RULES
+
+EOF
+
+class ExtractionError < StandardError; end
+class ExecutionError  < StandardError; end
+@failed_directories = []
+@mutex = Mutex.new
+
+def clarisse_main
+  options, directory_list = parse_arguments()
+
+  if options[:version]
+    puts "Clarisse #{PROGRAM_VERSION}" and exit 
+  end
+
+  configuration = load_configuration(options[:config])
+
+  execution_tree = build_configuration_tree(configuration, directory_list)
+  execution_tree = resolve_filenames(execution_tree)
+
+  queues = distribute_workload(execution_tree, options[:threads])
+
+  if options[:preview]
+    preview_execution(execution_tree, options, queues) and exit
+  end
+
+  begin_execution(queues, options)
+  summarize(options)
+  exit
+end
 
 
-### UTILITY FUNCTIONS [[[
+def parse_arguments
+  defaults = {
+    threads: 1,
+    verbose: false
+  }
 
-# Each thread will receive a list of directories and execute codeml for each directory/run according to the
-# operation mode and options
-def process(dirs)
-  dirs.each do |dir|
-    case @operation_mode
-    when :existing
-      threaded_puts dir.ljust(@column_width) + "Started".ljust(@column_width), verbose: true
+  ### Define command line options [[[
+  arguments = {}
+  # *parser* holds the definition of the command line arguments to be used by the module OptionParser
+  parser = OptionParser.new do |options|
+    options.banner  = "Usage: clarisse OPTIONS DIR..."
 
-      cmd = "cd #{dir}; codeml #{@options[:existing]}"
+    #options.on("-e", "--existing FILE", "Run codeml once on every DIR. FILE must already exist inside every DIR and will be used as control file.") do |path|
+    #  arguments[:existing] = path
+    #end
 
-      if system("#{cmd} >#{FILE_STDOUT} 2>#{FILE_STDERR}")
-        threaded_puts(dir.ljust(@column_width) + "Finished", verbose: true)
-      else
-        @failed_directories << dir
-        threaded_puts(dir.ljust(@column_width) + "*Failed*", verbose: true)
-        $stderr.puts "Error: codeml execution failed for directory #{dir}. Command was: '#{cmd}'"
+    options.on("-c", "--config FILE", "FILE will be parsed to determine the number of iterations and their options on every dir *Mandatory*") do |path|
+      arguments[:config] = path
+    end
+
+    options.on("--template FILE", "The contents of FILE will be appended to the dynamically generated control file.") do |path|
+      arguments[:template] = path
+    end
+
+    options.on("-t", "--threads N", "Number of threads in which to initially divide the workload.") do |n|
+      arguments[:threads] = n.to_i
+    end
+
+    options.on("-p", "--preview", "Don't execute codeml, but parse and validate options and present a preview of what would be executed.") do |n|
+      arguments[:preview] = true
+    end
+
+    options.on("-d", "--debug") do |n|
+      arguments[:debug] = true
+    end
+
+    options.on("-v", "Be verbose.") do |n|
+      arguments[:verbose] = true
+    end
+
+    options.on("-V", "--version", "Print Clarisse's version number.") do |n|
+      arguments[:version] = true
+    end
+
+    options.on("-h", "--help", "Print this screen") do
+      puts HELP_SHORT
+      puts
+      puts options
+      puts
+      puts HELP_LONG
+      exit
+    end
+  end
+  ### ]]]
+
+  # Execute the actual parsing and catch exceptions in case of invalid or incomplete options
+  begin parser.parse!
+  rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
+    $stderr.puts "Error: Failed while parsing command line arguments.  Check clarisse --help."
+    $stderr.puts e
+    abort
+  end
+
+  ### Mandatory arguments [[[
+  if not arguments[:config]
+    abort "Error: Configuration file was not specified."
+  end
+
+  if arguments[:threads] < 1
+    abort "Error: Invalid number of threads."
+  end
+  ### ]]]
+
+  ### Verify files and directories exist [[[
+  if not File.exist? arguments[:config]
+    abort "Error: File not found: #{arguments[:config]}."
+  elsif not File.readable? arguments[:config]
+    abort "Error: Failed to open file: #{arguments[:config]}."
+  end
+
+  if arguments[:template]
+    if not File.exist? arguments[:template] 
+      abort "Error: File not found: #{arguments[:template]}."
+    elsif not File.readable? arguments[:template]
+      abort "Error: Failed to open file: #{arguments[:template]}."
+    end
+  end
+
+
+  directory_list = ARGV
+  if directory_list.empty?
+    abort "Error: No list of directories was provided."
+  end
+
+  # Use the cleanpath method to get rid of useless characters, like a tailing slash
+  directory_list.map! {|directory| Pathname.new(directory).cleanpath.to_s}
+  # Remove duplicates
+  directory_list.uniq!
+
+  # Go through every directory name provided and confirm it's valid.
+  invalid_dirs = []
+  directory_list.each do |dir|
+    if not File.directory? dir
+      invalid_dirs << dir
+    end
+  end
+
+  if invalid_dirs.any?
+    $stderr.puts "Error: Invalid directories:"
+    invalid_dirs.each do |invalid_dir|
+      $stderr.puts invalid_dir
+    end
+  end
+  ### ]]]
+
+  # Find the largest string among the directory names and its column header
+  @column_alignment_width = [
+    directory_list.max_by(&:length),
+    COLUMN_ALIGNMENT_TITLE 
+  ].max_by(&:length).length 
+
+
+  return defaults.merge(arguments), directory_list
+end
+
+
+def load_configuration(configuration_file)
+  if not File.exist? configuration_file
+    abort "Error: File #{configuration_file} does not exist."
+  end
+
+  # Try to read and parse the file as YAML
+  begin
+    iterations = YAML::load_file(configuration_file)
+  rescue Psych::SyntaxError => e
+    abort "Error: #{configuration_file} contains invalid YAML syntax."
+    puts e
+  rescue Exception => e
+    abort "Error: Unknown problem while reading file #{configuration_file}."
+    puts e
+  end
+
+  ### Validate general structure [[[
+  if not iterations.is_a? Hash
+    abort "Error: #{configuration_file} is not properly structured. See the " \
+          "documentation for help." 
+  end
+
+  if not iterations.keys.all? {|key| key.is_a? Integer}
+    abort "Error: #{configuration_file}: iterations options are not grouped " \
+          "by iteration number."
+  end
+
+  if not iterations.keys.first == 1
+    abort "Error: #{configuration_file}: iteration numbers don't start from 1."
+  end
+
+  if not iterations.keys.each_cons(2).all? {|a,b| b = a + 1}
+    abort "Error: In file #{configuration_file}, iteration numbers must be "  \
+          "continuous."
+  end
+  ### ]]]
+
+  ### Validate syntax for every option [[[
+  iterations.each do |iteration, options|
+    options.each do |key, value|
+      # Exit if there are strange options
+      # TODO: Validate there are no empty values?
+      # TODO: Restrict the valid characters strings to a limited set
+      if not (value.is_a? String or value.is_a? Numeric)
+        abort "Error: #{configuration_file}|#{iteration}:#{key}: Invalid value"
       end
 
 
-    when :config
-      ### The object run_information will hold the paths of the control and result files,
-      ### which we will use to execute codeml and extract results to generate next run's
-      ### control file
-      run_information = {}
-      dir_total_time = 0
-      @config.each do |run, options|
-        begin
-          control_file = FILE_COMMON_PREFIX + run.to_s + FILE_CONTROL_SUFFIX
-          run_information[run] = {}
-          run_information[run][:control] = "#{dir}/#{control_file}"
+      # If the key starts with CONFIG_FILE_MARKER, there is more checking to do
+      if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
+        # Validate option is not empty
+        if value.length.eql? 1
+          abort "Error: #{configuration_file}|#{iteration}/#{key}: missing "  \
+                "value after #{CONFIG_FILE_MARKER}." 
+        end
 
-          File.open("#{dir}/#{control_file}", 'w') do |file|
-            file.puts CONTROL_FILE_START
-
-            # For each option, check if it starts with CONFIG_FILE_MARKER so parsing is required
-            options.each do |key,value|
-              if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
-                # File resolution
-                # TODO Move this to a function and use it here and when checking options
-                if CONFIG_FILE_POINTERS.include? key
-                  files_found = Dir.glob("#{dir}/#{value[1..-1]}")
-                  if files_found.none?
-                    abort "Error: Could not find file #{dir}/#{value[1..-1]}. (#{dir}/#{run})"
-                  end
-                  dir_path = Pathname.new(dir)
-                  value = Pathname.new(files_found.first).relative_path_from(dir_path).to_s
-
-                  
-                # Previous result extraction
-                else
-                  source_run, keyword = value[1..-1].split(CONFIG_FILE_SEPARATOR)
-                  if not keyword.is_a? Regexp
-                    keyword = /#{keyword}/ 
-                  end
-
-                  source_file = run_information[source_run.to_i][:out]
-                  value = extract_value_from(keyword, source_file)
-                  if value.nil?
-                    abort "Error: Extracting #{key} from file #{source_file} failed."
-                  end
-                end
-              end
-
-              file.puts format_option(key, value)
-            end
-
-            file.puts CONTROL_FILE_END
-
-            # If a template was specified, append its contents
-            if @options[:template]
-              File.open(@options[:template]) do |tmpl|
-                tmpl.each_line do |line|
-                  file.puts line
-                end
-              end
-            end
+        # If the option is not a file glob, it must be an extractor for a 
+        # previous iteration.  In that case, it must have the '=N->key' format,
+        # where N is the iteration number and key is the value to extract
+        if not CONFIG_FILE_POINTERS.include? key
+          if iteration == 1
+            abort "Error: #{configuration_file}|#{iteration}/#{key}: "        \
+                  "First iteration cannot include an extraction option."
           end
 
-          # Add the outfile to this run's info
-          run_information[run][:out] = "#{dir}/#{extract_value_from(/outfile/, run_information[run][:control])}"
+          if not REGEX_EXTRACTION.match(value)
+            abort "Error: Invalid option in configuration file: #{value}."
+          end
 
-
-          #if @options[:verbose]
-          #  threaded_puts(msg + COLUMN_EVENT_START.ljust(COLUMN_EVENT_WIDTH))
-          #end
-
-          msg  = dir.to_s.ljust(COLUMN_ALIGNMENT_WIDTH) + COLUMN_SPACING
-          #msg += "#{run} / #{@total_iterations}".ljust(COLUMN_ITERATION_WIDTH) + COLUMN_SPACING
-          msg += run.to_s.ljust(COLUMN_ITERATION_WIDTH) + COLUMN_SPACING
-
-          cmd = "cd #{dir}; codeml #{control_file}"
-          file_stdout = FILE_COMMON_PREFIX + run.to_s + FILE_STDOUT_SUFFIX
-          file_stderr = FILE_COMMON_PREFIX + run.to_s + FILE_STDERR_SUFFIX
-
-          run_start_time = Time::now 
-          system(cmd + ">#{file_stdout} 2>#{file_stderr}")
-
-          if $?.exitstatus.eql? 0
-            run_time = Time::now - run_start_time
-            dir_total_time += run_time
-
-            if @options[:verbose]
-              #msg += COLUMN_EVENT_SUCCESS.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
-              msg += "#{human_readable_time(run_time)} / #{human_readable_time(dir_total_time)}"
-              threaded_puts(msg)
-            end
-
-          else
-            @failed_directories << dir
-            if @options[:verbose]
-              msg += COLUMN_EVENT_FAILURE.ljust(COLUMN_EVENT_WIDTH)
-              threaded_puts(msg)
-            end
-            $stderr.puts "Error: codeml run for #{dir}/#{run} returned an error code."
-            break
-            #raise ExecError, out.split("\n").grep(CODEML_ERRORS).join("|")
+          source_iteration = REGEX_EXTRACTION.match(value)[:iter].to_i
+          if not source_iteration < iteration
+            abort "Error: Invalid option in configuration file: "             \
+                  "Iteration #{iteration} can't extract a result from "       \
+                  "iteration #{source_iteration}."
           end
         end
       end
     end
   end
+  ### ]]]
+
+  return iterations
 end
 
+
+def build_configuration_tree(configuration, directory_list)
+  iterations_tree = {}
+  directory_list.each do |directory|
+    iterations_tree[directory] = configuration
+  end
+  return iterations_tree
+end
+
+
+def resolve_filenames(execution_tree)
+  execution_tree.each do |directory, iterations|
+    iterations.each do |iteration, options|
+      options.each do |key, value|
+        if CONFIG_FILE_POINTERS.include? key and value.start_with? CONFIG_FILE_MARKER
+          value = value[1..-1].lstrip
+          if Pathname.new(value).absolute?
+            files_found = Dir.glob(value)
+          else
+            files_found = Dir.glob(directory + "/" + value)
+          end
+          if files_found.none?
+            abort "Error: #{directory}/#{iteration}/#{key} = #{directory}/#{value}: File not found"
+          elsif not files_found.one?
+            abort "Error: #{directory}/#{iteration}/#{key} = #{directory}/#{value}: More than one file found"
+          else
+            relative_path = Pathname.new(files_found.first).relative_path_from(Pathname.new(directory)).to_s
+            execution_tree[directory][iteration][key] = relative_path
+          end
+        end
+      end
+    end
+  end
+  return execution_tree
+end
+
+
+def preview_execution(execution_tree, options, queues)
+  puts "### Codeml will be executed on #{execution_tree.length} alignments, with #{execution_tree.first.length} iterations each."
+  puts "### The following options have been defined for each iteration and all supported file expansions have been resolved in relation to each alignment's directory:"
+  puts
+  execution_tree.each do |directory, iterations|
+    iterations.each do |iteration, options|
+      puts "# Alignment: #{directory} / Iteration: #{iteration}:"
+      options.each do |key, value|
+        if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
+          source_iteration = REGEX_EXTRACTION.match(value)[:iter]
+          value = "[extract from results of iteration #{source_iteration}]"
+        end
+        puts "#{key.to_s.rjust(CONTROL_FILE_ALIGN)} = #{value}"
+      end
+      puts
+    end
+  end
+
+  if options[:template]
+    puts
+    puts  "### In addition to the above options, the following template will be appended to each control file."
+    puts
+    begin
+      File.open(options[:template], "r") do |template|
+        template.each_line do |line|
+          puts line
+        end
+      end
+    rescue Exception => e
+      abort "Error: Failed to read template file #{options[:template]}"
+    end
+    puts
+  end
+
+  if options[:threads] > 1
+    puts
+    puts  "### Execution will be distributed among #{options[:threads]} threads, with the following per-thread workload:"
+    puts
+
+    header  = COLUMN_QUEUE_TITLE.ljust(COLUMN_QUEUE_WIDTH) + COLUMN_SPACING
+    header += COLUMN_DIRS_TITLE
+    puts header
+
+    queue_number = 1
+    queues.each_index do |queue|
+      queue_printed = false
+      queues[queue].keys.each do |directory|
+        if not queue_printed
+          line  = queue_number.to_s.center(COLUMN_QUEUE_WIDTH) + COLUMN_SPACING
+          line += directory.to_s
+          puts line
+          queue_printed = true
+        else
+          line = " ".ljust(COLUMN_QUEUE_WIDTH) + COLUMN_SPACING
+          line += directory.to_s
+          puts line
+        end
+      end
+      queue_number += 1
+      puts
+    end
+  else
+    puts  "### Execution will performed on a single thread."
+  end
+
+end
+
+
+### Process received options [[[
+def distribute_workload(execution_tree, threads)
+  directories_per_queue = (execution_tree.length/threads.to_f).ceil
+  queues = []
+  execution_tree.keys.each_slice(directories_per_queue) do |key_slice|
+    thread_queue = {}
+    key_slice.each do |key|
+      thread_queue[key] = execution_tree[key]
+    end
+    queues << thread_queue
+  end
+
+  return queues
+end
+
+
+def begin_execution(queues, options)
+  ### Print headers [[[
+  header  = COLUMN_ALIGNMENT_TITLE.ljust(@column_alignment_width) + COLUMN_SPACING
+  header += COLUMN_ITERATION_TITLE.ljust(COLUMN_ITERATION_WIDTH)  + COLUMN_SPACING
+  if options[:verbose]
+    header += COLUMN_EVENT_TITLE.ljust(COLUMN_EVENT_WIDTH)        + COLUMN_SPACING  
+  end
+  header += COLUMN_TIME_TITLE.ljust(COLUMN_TIME_WIDTH)
+  puts header
+  # ]]]
+
+  threads = []
+  queues.each do |workload|
+    threads << Thread.new{ process_workload(workload, options) }
+  end
+
+  threads.each do |thread|
+    thread.join
+  end
+end
+
+
+def process_workload(workload, options)
+  workload.each do |directory, iterations|
+    files = {}
+    total_time = 0
+
+    begin
+      iterations.each do |current_iteration, iteration_options|
+        files[current_iteration] = {}
+        msg  = directory.to_s.ljust(@column_alignment_width) + COLUMN_SPACING
+        msg += current_iteration.to_s.ljust(COLUMN_ITERATION_WIDTH) + COLUMN_SPACING
+
+        ### Generate control file [[[
+        control_file_basename = FILE_COMMON_PREFIX + current_iteration.to_s + FILE_CONTROL_SUFFIX
+        control_file_path = Pathname.new(directory + "/" + control_file_basename).expand_path
+        files[current_iteration][:control] = control_file_path
+        File.open(control_file_path, 'w') do |file|
+          file.puts CONTROL_FILE_START
+
+          # If it starts with CONFIG_FILE_MARKER then parsing is required. Since glob
+          # expansion was done earlier, at this point we only care about extraction options
+          iteration_options.each do |key, value|
+            if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
+              matches = REGEX_EXTRACTION.match(value)
+              if matches.size.eql? 0
+                raise ExtractionError, "#{value} could not be parsed"
+              end
+              source_iteration, keyword = matches.captures
+
+              if not keyword.is_a? Regexp
+                keyword = /#{keyword}/ 
+              end
+
+              source_file = files[source_iteration.to_i][:outfile]
+              value = extract_value_from(keyword, source_file)
+
+              if value.nil?
+                msg += "Error! Failed to extract #{key} from #{source_file}. Skipping remaining iterations for this alignment"
+                raise ExtractionError
+              end
+
+            end
+
+            file.puts format_option(key, value)
+          end
+
+          file.puts CONTROL_FILE_END
+          file.puts
+
+          # If a template was specified, append its contents
+          if options[:template]
+            File.open(options[:template]) do |template|
+              template.each_line do |line|
+                file.puts line
+              end
+            end
+          end
+        end
+        ### ]]]
+
+        # Parse this iteration's control file for the output file name and store it for possible
+        # later extractions
+        current_output_file = directory.to_s + "/" + extract_value_from(/outfile/, control_file_path)
+        files[current_iteration][:outfile] = Pathname.new(files[current_iteration][:control]).expand_path.to_s
+
+        if options[:verbose]
+          msg_start  = msg + COLUMN_EVENT_START.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
+          msg_start += "-"
+          threaded_puts(msg_start)
+        end
+
+        cmd = "cd #{directory}; codeml #{files[current_iteration][:control]}"
+        start_time = Time::now 
+
+        if options[:save]
+          file_stdout = FILE_COMMON_PREFIX + current_iteration.to_s + FILE_STDOUT_SUFFIX
+          file_stderr = FILE_COMMON_PREFIX + current_iteration.to_s + FILE_STDERR_SUFFIX
+          system(cmd + ">#{file_stdout} 2>#{file_stderr}")
+        else
+          system(cmd + ">/dev/null 2>&1")
+        end
+
+        runtime = Time::now - start_time
+        total_time += runtime
+
+        if $?.exitstatus.eql? 0
+
+          if options[:verbose]
+            msg += COLUMN_EVENT_SUCCESS.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
+          end
+          msg += "#{human_readable_time(runtime)} / #{human_readable_time(total_time)}"
+          threaded_puts(msg)
+
+        else
+          @failed_directories << dir
+          if options[:verbose]
+            msg += COLUMN_EVENT_FAILURE.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
+          end
+          msg += "#{human_readable_time(runtime)} / #{human_readable_time(total_time)}".ljust(COLUMN_TIME_WIDTH) + COLUMN_SPACING
+          msg += "Failed! Skipping remaining iterations for this alignment"
+          threaded_puts(msg)
+          raise ExecutionError
+          #raise ExecError, out.split("\n").grep(CODEML_ERRORS).join("|")
+        end
+      end
+    rescue ExtractionError, ExecutionError => e
+      break
+    rescue Exception => e
+      if options[:debug]
+        #puts e
+        threaded_puts e.message + "\n" + e.backtrace.join("\n")
+        abort
+      else
+        break
+      end
+    end
+  end
+end
+
+def summarize(options)
+  # Summarize failures, if any
+  if @failed_directories.empty?
+    if options[:verbose]
+      puts
+      puts "Successfully executed all iterations"
+    end
+  else
+    if @failed_directories.length.eql? @dirs.length
+      puts
+      puts "codeml execution failed on every alignment."
+    else
+      puts
+      puts "codeml execution failed on #{@failed_directories.length} alignments:"
+      @failed_directories.each do |directory|
+        puts directory.to_s
+      end
+    end
+  end
+end
+
+# Each thread will receive its own directory_list and a common iteration_list
 def threaded_puts(message)
   @mutex.synchronize {
     puts message
@@ -208,7 +607,7 @@ def threaded_puts(message)
 end
 
 ##### Extract a value from a results file to be used in a control file
-def extract_value_from keyword, source
+def extract_value_from(keyword, source)
   if not File.exist? source
     return nil
   end
@@ -234,401 +633,18 @@ def format_option option, value
   return "#{option.rjust(CONTROL_FILE_ALIGN)} = #{value}"
 end
 
-def human_readable_time seconds
+
+def human_readable_time(seconds)
   seconds = seconds.to_i
-  return "#{(seconds/3600).to_s.rjust(2,'0')}:#{((seconds%3600)/60).to_s.rjust(2,'0')}:#{((seconds%3600)%60).to_s.rjust(2,0.to_s)}"
-end
+  hours = seconds/3600
+  seconds %= 3600
+  minutes = seconds/60
+  seconds %= 60
 
-# Read a configuration file for clarisse's config operation mode or results extraction.  Since the requirements for both differ slightly, 
-# a type must be defined.
-def read_configuration_file(filepath, type=:config)
-  if not File.exist? filepath
-    abort "Error: File #{filepath} does not exist."
-  end
-
-  # Try to read and parse the file as YAML
-  begin
-    config_tree = YAML::load_file(filepath)
-  rescue Psych::SyntaxError
-    abort "Error: File #{filepath} contains invalid YAML syntax."
-  rescue Exception => e
-    abort "Unknown error while reading Clarisse configuration file #{filepath}."
-    puts e
-  end
-
-  # Check the file has a correct general structure and its keys are ordered numbers.
-  if not config_tree.is_a? Hash
-    abort "Configuration file #{filepath} is not properly structured. See clarisse --help for examples." 
-  end
-
-  # Validate all top-level keys are numbers
-  if not config_tree.keys.all? {|key| key.is_a? Integer}
-    abort "Error: Configuration options in #{filepath} are not grouped by run numbers."
-  end
-
-  case type
-  when :config
-    # If the configuration file is for the configuration mode, make sure keys are sorted. Not necessary for results extraction.
-    if not config_tree.keys.first == 1 or not config_tree.keys.each_cons(2).all? {|a,b| b = a + 1}
-      abort "Error: Run numbers in file #{filepath} are not continuous." if not run.eql? current
-    end
-
-    config.each do |run, options|
-      options.each do |key, value|
-        # Make sure the value is at least a string or looks like a number.
-        if not (value.is_a? String or value.is_a? Numeric)
-          abort "Error: Options in configuration file must be strings or numeric values, but on #{filepath} the value of #{run}:#{key} was detected as #{value}."
-        end
-
-        # If the key starts with CONFIG_FILE_MARKER, there is more checking to do
-        if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
-          if value.length.eql? 1
-            abort "Error: Option #{filepath}/#{run}/#{key} is missing the configuration string after #{CONFIG_FILE_MARKER}. Check the manual for information." 
-          end
-
-          # If the option requires finding a file, verify that one and only one file is found on every directory
-          if CONFIG_FILE_POINTERS.include? key
-            @dirs.each do |dir|
-              files_found = Dir.glob("#{dir}/#{value[1..-1]}")
-              if files_found.none?
-                abort "Error: Validation of option #{filepath}/#{run}/#{key} failed. File not found with search: #{dir}/#{value[1..-1]}."
-              elsif not files_found.one?
-                abort "Error: Validation of option #{filepath}/#{run}/#{key} failed. More than one file found with search: #{dir}/#{value[1..-1]}."
-              end
-            end
-
-          # If the option does not require a file, check that it has the proper format and points to a valid run
-          else
-            if run == 1
-              abort "Error: Validation of option #{filepath}/#{run}/#{key} failed. First run cannot include an extraction option. Check the manual for information."
-            end
-
-            if not value.count(CONFIG_FILE_SEPARATOR).eql? 1
-              abort "Error: Validation of option #{filepath}/#{run}/#{key} failed. Format is 'RUN#{CONFIG_FILE_SEPARATOR}KEY'. Check the manual for information."
-            end
-
-            source_run, key_to_extract = value[1..-1].split(CONFIG_FILE_SEPARATOR)
-            if source_run.empty? or key_to_extract.empty?
-              abort "Error: Validation of option #{filepath}/#{run}/#{key} failed. Format is 'RUN#{CONFIG_FILE_SEPARATOR}KEY'. Check the manual for information."
-            end
-
-            if source_run >= run
-              abort "Error: Validation of option #{filepath}/#{run}/#{key} failed. Run to extract result from is not a previous one. Check the manual for information."
-            end
-          end
-        end
-      end
-    end
-
-
-  when :results
-    config.each do |run, options|
-      if not options.include? RESULTS_FILE_KEY
-        abort "Error: File #{filepath} contains no #{RESULTS_FILE_KEY} option on run #{run}." 
-      end
-
-      options.each do |key, value|
-        if not RESULTS_VALID_OPTIONS.include? key
-          abort "Error: File #{filepath} contains invalid option #{key}. Check the manual for valid options."
-        end
-
-        if not (value.is_a? TrueClass or value.is_a? FalseClass)
-          abort "Error: Validation of option #{filepath}/#{run}/#{key} failed. Check the manual for information."
-        end
-      end
-    end
-  end
-
-  return config_tree
-end
-### ]]]
-
-
-
-### PARSE COMMAND-LINE ARGUMENTS [[[
-# Empty hash where the parsed command line arguments will be stored.
-params = {}
-
-# *parser* holds the definition of the command line arguments to be used by the 
-# module OptionParser
-parser = OptionParser.new do |options|
-  options.banner  = "Usage: clarisse OPTIONS DIR..."
-
-  options.on("-e", "--existing FILE", "Run codeml once on every DIR. FILE must already exist inside every DIR and will be used as control file.") do |path|
-    params[:existing] = path
-  end
-
-  options.on("-c", "--config FILE", "Run codeml once or more on every DIR. FILE will be used to dynamically generate control files.") do |path|
-    params[:config] = path
-  end
-
-  options.on("--template FILE", "Valid when using --config. Options defined in FILE will be added to every control file.") do |path|
-    params[:template] = path
-  end
-
-  options.on("--results FILE", "Options defined in FILE will be used for the extraction of results. Can be used independently.") do |path|
-    params[:results] = path
-  end
-
-  options.on("-t", "--threads N", "Number of threads in which to initially divide the workload.") do |n|
-    params[:threads] = n.to_i
-  end
-
-  options.on("-v", "Be verbose.") do |n|
-    params[:verbose] = true
-  end
-
-  options.on("--version", "Print Clarisse's version number.") do |n|
-    params[:version] = true
-  end
-
-  options.on("-h", "--help", "Print this screen") do
-    puts "Clarisse is a script that automates the execution of codeml over a number of directories. It can copy or generate the necessary control files and then use them to execute codeml."
-    puts options
-    exit
-  end
-end
-
-# Execute the actual parsing and catch exceptions in case of invalid or incomplete options
-begin parser.parse!
-rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
-  # There was a problem parsing the options. Print the error and exit
-  puts e
-  puts parser
-  abort
-end
-
-# Defaults that will be combined with the command line arguments.
-defaults = {
-  threads: 1
-}
-
-# Merge the parsed command line arguments with the defaults. The given order assures that any
-# parsed option overwrites the defaults.
-@options = defaults.merge params
-### ]]]
-
-
-
-
-### Process received options [[[
-
-# If the version was requested, print it and exit.
-if @options[:version]
-  puts "Clarisse #{PROGRAM_VERSION}"
-  exit 
+  return  hours.to_s.rjust(2,'0') + ":" + minutes.to_s.rjust(2,'0') + ":" +
+          seconds.to_s.rjust(2,'0')
 end
 
 
-# Validate that at least one operation mode was specified.
-if [ @options[:control],
-     @options[:existing],
-     @options[:config],
-     @options[:results] ].none?
-  abort "Error: No operation mode was specified."
-end
-
-# Validate that only one operating mode was chosen.
-if [ @options[:existing],
-     @options[:config] ].count {|mode| not mode.nil?} > 1
-  abort "Error: More than one of --control, --config or --existing was used."
-end
-
-# Validate directories
-@dirs = ARGV
-
-if @dirs.empty?
-  abort "Error: No list of directories was provided. Use 'clarisse --help' for information."
-end
-
-@dirs.uniq!
-
-# Go through every directory name provided and confirm it's valid.
-invalid_dirs = []
-@dirs.each do |dir|
-  if not File.directory? dir
-    invalid_dirs << dir
-  end
-end
-
-if invalid_dirs.any?
-  abort "Error: Invalid directories: #{invalid_dirs.join(", ")}"
-end
-### ]]]
-
-
-
-
-### Initialize [[[
-if @options[:existing]
-  missing_files = []
-  @dirs.each do |dir|
-    file = "#{dir}/#{@options[:existing]}"
-    if not File.exist? file
-      missing_files << file
-    end
-  end
-
-  if not missing_files.empty?
-    $stderr.puts "> ERROR! The following control files could not be found:"
-    missing_files.each do |file|
-      $stderr.puts "> " + file
-    end
-    abort
-  end
-  @operation_mode = :existing
-
-elsif @options[:config]
-  @config = read_configuration_file(@options[:config], type: :config)
-  @operation_mode = :config
-  @total_iterations = @config.keys.last
-end
-
-@failed_directories = []
-@mutex = Mutex.new
-# ]]]
-
-
-
-
-### QUEUES DISTRIBUTION [[[
-# Create an array with N empty arrays, where N matches the number of threads given in the options.
-# These arrays will act as word queues for every thread
-@queues = Array.new(@options[:threads]) { Array.new }
-
-# Distribute the directories into the queues
-current = 0
-@dirs.each do |dir|
-  @queues[current] << dir
-  current += 1
-  current = 0 if current.eql? @options[:threads]
-end
-
-# Remove empty arrays, if any.
-@queues.select!{|q| not q.empty?}
-### ]]]
-
-
-
-### EXECUTION STARTS
-
-### Print headers [[[
-# Find the largest string among the directory names and its column header
-COLUMN_ALIGNMENT_WIDTH = [
-  @dirs.max_by(&:length),
-  COLUMN_ALIGNMENT_TITLE 
-].max_by(&:length).length 
-
-header  = COLUMN_ALIGNMENT_TITLE.ljust(COLUMN_ALIGNMENT_WIDTH)  + COLUMN_SPACING
-header += COLUMN_ITERATION_TITLE.ljust(COLUMN_ITERATION_WIDTH)  + COLUMN_SPACING  if @operation_mode.eql? :config
-header += COLUMN_EVENT_TITLE.ljust(COLUMN_EVENT_WIDTH)          + COLUMN_SPACING  if @options[:verbose]
-header += COLUMN_TIME_TITLE.ljust(COLUMN_TIME_WIDTH)
-puts header
-# ]]]
-
-### Start threaded execution [[[
-threads = []
-@queues.each do |directories_queue|
-  threads << Thread.new{process directories_queue}
-end
-
-threads.each do |thread|
-  thread.join
-end
-# ]]]
-
-# Summarize failures, if any
-if @failed_directories.any?
-  puts
-  if @failed_directories.length.eql? @dirs.length
-    puts "codeml execution failed on every alignment."
-  else
-    puts "codeml execution failed on #{@failed_directories.length} alignments:"
-    @failed_directories.each do |directory|
-      puts directory.to_s
-    end
-  end
-end
-
-##### Generate a results file if we were asked to
-#if @options[:results]
-#  single = @results.length.eql? 1
-#
-#  File.open(FILE_RESULTS_NAME, "w") do |out|
-#    if single
-#      out.puts "Directory;ntime;np;log;omega;w_ratios"
-#    else
-#      out.puts "Directory;Pass;ntime;np;log;omega;w_ratios"
-#    end
-#
-#    @dirs.each do |dir|
-#      @results.each do |pass, options|
-#        outfile = "#{dir}/#{options["outfile"]}"
-#        lnl = []
-#        omega = nil
-#        w_ratios = []
-#
-#        begin
-#          tree_found = false
-#          File.open(outfile, "r") do |file|
-#            file.each_line do |line|
-#
-#              if options["lnL"]
-#                if line.match(/^lnL/)
-#                  lnl = line.match(LNL)
-#                  if lnl
-#                    lnl = lnl.captures
-#                  end
-#                  next
-#                end
-#              end
-#
-#              if options["omega"]
-#                if line.match(/^omega/)
-#                  omega = line.match(OMEGA).to_s
-#                  next
-#                end
-#              end
-#
-#              if options["w_ratios"]
-#                if line.match(W_RATIOS)
-#                  tree_found = true
-#                elsif tree_found
-#                  #w_ratios = line.scan(/(?<=#)[0-9.]+(?=\s)/).uniq
-#                  w_ratios = line.scan(/(?<=#)[0-9.]+(?=\s)/).uniq
-#                  tree_found = false
-#                  next
-#                end
-#              end
-#            end
-#          end
-#
-#          lnl = [NOT_FOUND]*3 if lnl.empty? and options["lnL"]
-#          omega = NOT_FOUND if omega.nil? and options["omega"]
-#          w_ratios = [NOT_FOUND] if w_ratios.empty? and options["w_ratios"]
-#
-#          if single
-#            out.print "#{dir};#{lnl[0]};#{lnl[1]};#{lnl[2]};#{omega}"
-#            w_ratios.each do |w|
-#              out.print ";#{w}"
-#            end
-#            out.puts
-#
-#          else
-#            out.print "#{dir};#{pass};#{lnl[0]};#{lnl[1]};#{lnl[2]};#{omega}"
-#
-#            w_ratios.each do |w|
-#              out.print ";#{w}"
-#            end
-#            out.puts
-#
-#          end
-#
-#        rescue Errno::ENOENT => e
-#          $stderr.puts "ERROR: #{e.message}"
-#        end
-#      end
-#    end
-#  end
-#  threaded_puts "OK"
-#end
+# Start execution
+clarisse_main()

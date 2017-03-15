@@ -1,5 +1,6 @@
 # Clarisse: a wrapper for automatic codeml execution
 ==================================================
+
 Clarisse is a [Ruby] (https://www.ruby-lang.org/en/) script that automates the execution of [codeml] (http://envgen.nox.ac.uk/bioinformatics/docs/codeml.html), from [PAML] (http://abacus.gene.ucl.ac.uk/software/paml.html), over a number of directories. It can copy or generate the necessary control files and then use them to execute codeml. It has three execution modes that define the control file to be used:
 - Copying a source control file to every directory. This is specified with the option --control
 - Using a control file that already exists on every directory and that shares the same name. The existing control file name is specified with --existing

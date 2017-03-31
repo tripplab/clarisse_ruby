@@ -27,7 +27,7 @@ require 'json'
 require 'yaml'
 
 
-PROGRAM_VERSION       = "2.0.0"
+PROGRAM_VERSION       = "2.0.1"
 
 CONFIG_FILE_MARKER    = "="
 CONFIG_FILE_SEPARATOR = "->"
@@ -37,7 +37,7 @@ CONTROL_FILE_START    = " *** START OF DYNAMICALLY GENERATED OPTIONS ***"
 CONTROL_FILE_END      = " *** END OF DYNAMICALLY GENERATED OPTIONS ***"
 CONTROL_FILE_ALIGN    = 13
 
-FILE_COMMON_PREFIX    = "_clarisse_"
+FILE_COMMON_PREFIX    = "_"
 FILE_CONTROL_SUFFIX   = ".ctl"
 FILE_STDOUT_SUFFIX    = ".stdout"
 FILE_STDERR_SUFFIX    = ".stderr"
@@ -53,10 +53,19 @@ COLUMN_QUEUE_WIDTH      = COLUMN_QUEUE_TITLE.length
 COLUMN_DIRS_TITLE       = "Alignments"
 COLUMN_DIRS_WIDTH       = COLUMN_DIRS_TITLE.length
 
+COLUMN_FAILURE_SOURCE_TITLE = "During"
+COLUMN_FAILURE_SOURCE = {
+  clarisse: "Clarisse execution",
+  codeml:   "Codeml execution"
+}
+COLUMN_FAILURE_SOURCE_WIDTH = COLUMN_FAILURE_SOURCE.values.max_by(&:length).length
+COLUMN_FAILURE_REASON_TITLE = "Reason"
+COLUMN_FAILURE_REASON_WIDTH = [COLUMN_FAILURE_REASON_TITLE.length, 20].max
+
 COLUMN_EVENT_TITLE      = "Status"
 COLUMN_EVENT_START      = "Started"
 COLUMN_EVENT_SUCCESS    = "Finished"
-COLUMN_EVENT_FAILURE    = "*Failed"
+COLUMN_EVENT_FAILURE    = "FAILED"
 COLUMN_EVENT_WIDTH      = [
   COLUMN_EVENT_START,
   COLUMN_EVENT_SUCCESS,
@@ -64,6 +73,7 @@ COLUMN_EVENT_WIDTH      = [
   COLUMN_EVENT_TITLE
 ].max_by(&:length).length
 
+REGEX_ERROR_DETECTION = /^Error.*/
 REGEX_EXTRACTION  = /^#{CONFIG_FILE_MARKER}\s*(?<iter>[[:digit:]]+)\s*#{CONFIG_FILE_SEPARATOR}\s*(?<key>[[:alnum:]]+)\s*$/
 
 # TODO: Add better descriptions
@@ -94,7 +104,8 @@ def clarisse_main
   queues = distribute_workload(execution_tree, options[:threads])
 
   if options[:preview]
-    preview_execution(execution_tree, options, queues) and exit
+    preview_execution(execution_tree, options, queues)
+    exit
   end
 
   begin_execution(queues, options)
@@ -470,7 +481,15 @@ def process_workload(workload, options)
     begin
       iterations.each do |current_iteration, iteration_options|
         files[current_iteration] = {}
-        msg  = directory.to_s.ljust(@column_alignment_width) + COLUMN_SPACING
+        failure = {}
+
+        if directory.eql? "."
+          directory_name = Pathname.new(directory).expand_path.basename.to_s
+        else
+          directory_name = directory
+        end
+
+        msg  = directory_name.ljust(@column_alignment_width) + COLUMN_SPACING
         msg += current_iteration.to_s.ljust(COLUMN_ITERATION_WIDTH) + COLUMN_SPACING
 
         ### Generate control file [[[
@@ -528,26 +547,44 @@ def process_workload(workload, options)
 
         if options[:verbose]
           msg_start  = msg + COLUMN_EVENT_START.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
-          msg_start += "-"
           threaded_puts(msg_start)
         end
 
         cmd = "cd #{directory}; codeml #{files[current_iteration][:control]}"
         start_time = Time::now 
 
-        if options[:save]
-          file_stdout = FILE_COMMON_PREFIX + current_iteration.to_s + FILE_STDOUT_SUFFIX
-          file_stderr = FILE_COMMON_PREFIX + current_iteration.to_s + FILE_STDERR_SUFFIX
-          system(cmd + ">#{file_stdout} 2>#{file_stderr}")
-        else
-          system(cmd + ">/dev/null 2>&1")
-        end
+        file_stdout = FILE_COMMON_PREFIX + current_iteration.to_s + FILE_STDOUT_SUFFIX
+        file_stderr = FILE_COMMON_PREFIX + current_iteration.to_s + FILE_STDERR_SUFFIX
+        system(cmd + ">#{file_stdout} 2>#{file_stderr}")
 
+        path_stderr = directory + "/" + file_stderr
+        path_stdout = directory + "/" + file_stdout
+
+        if File.exists? path_stderr and File.zero? path_stderr
+          File.delete path_stderr
+        end
+        
         runtime = Time::now - start_time
         total_time += runtime
 
-        if $?.exitstatus.eql? 0
+        # Experimental
+        if not $?.exitstatus.eql? 0
+          failure[:source] = :codeml
+          reason = "Exit status was #{$?.exitstatus}. Last line of output: \"#{File.open(path_stdout).to_a.last.delete("\n")}\""
+          #reason = file_stdout + ': "' +  + '"'
+          failure[:reason] = reason
+        else
+          File.open(path_stdout).each_line do |line|
+            if REGEX_ERROR_DETECTION.match(line)
+              failure[:source] = :codeml
+              reason = "Error detected in output: \"#{line.delete("\n")}\""
+              failure[:reason] = reason
+            end
+          end
+        end
+        
 
+        if failure.empty?
           if options[:verbose]
             msg += COLUMN_EVENT_SUCCESS.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
           end
@@ -555,27 +592,24 @@ def process_workload(workload, options)
           threaded_puts(msg)
 
         else
-          @failed_directories << dir
+          failure[:directory] = directory_name
+          failure[:iteration] = current_iteration
+          @failed_directories << failure
           if options[:verbose]
             msg += COLUMN_EVENT_FAILURE.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
           end
           msg += "#{human_readable_time(runtime)} / #{human_readable_time(total_time)}".ljust(COLUMN_TIME_WIDTH) + COLUMN_SPACING
-          msg += "Failed! Skipping remaining iterations for this alignment"
           threaded_puts(msg)
           raise ExecutionError
           #raise ExecError, out.split("\n").grep(CODEML_ERRORS).join("|")
         end
       end
     rescue ExtractionError, ExecutionError => e
-      break
+      next
     rescue Exception => e
-      if options[:debug]
-        #puts e
-        threaded_puts e.message + "\n" + e.backtrace.join("\n")
-        abort
-      else
-        break
-      end
+      threaded_puts "Unknown error during execution of Clarisse"
+      threaded_puts e.message + "\n" + e.backtrace.join("\n")
+      abort
     end
   end
 end
@@ -588,16 +622,26 @@ def summarize(options)
       puts "Successfully executed all iterations"
     end
   else
-    if @failed_directories.length.eql? @dirs.length
-      puts
-      puts "codeml execution failed on every alignment."
-    else
-      puts
-      puts "codeml execution failed on #{@failed_directories.length} alignments:"
-      @failed_directories.each do |directory|
-        puts directory.to_s
-      end
+    puts "\n" * 3
+    puts "            --- ERROR REPORT ---"
+    puts
+
+    header  = COLUMN_ALIGNMENT_TITLE.ljust(@column_alignment_width) + COLUMN_SPACING
+    header += COLUMN_ITERATION_TITLE.ljust(COLUMN_ITERATION_WIDTH)  + COLUMN_SPACING
+    header += COLUMN_FAILURE_SOURCE_TITLE.ljust(COLUMN_FAILURE_SOURCE_WIDTH)      + COLUMN_SPACING
+    header += COLUMN_FAILURE_REASON_TITLE.ljust(COLUMN_FAILURE_REASON_WIDTH)      + COLUMN_SPACING
+    puts header
+
+    @failed_directories.each do |directory|
+      line  = directory[:directory].ljust(@column_alignment_width)      + COLUMN_SPACING
+      line += directory[:iteration].to_s.ljust(COLUMN_ITERATION_WIDTH)  + COLUMN_SPACING
+      line += COLUMN_FAILURE_SOURCE[directory[:source]].ljust(COLUMN_FAILURE_SOURCE_WIDTH)  + COLUMN_SPACING
+      line += directory[:reason].ljust(COLUMN_FAILURE_SOURCE_WIDTH)            + COLUMN_SPACING
+      puts line
     end
+
+    puts
+    puts "#{@failed_directories.length} errors"
   end
 end
 

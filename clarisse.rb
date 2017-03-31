@@ -86,10 +86,6 @@ class ExecutionError  < StandardError; end
 def clarisse_main
   options, directory_list = parse_arguments()
 
-  if options[:version]
-    puts "Clarisse #{PROGRAM_VERSION}" and exit 
-  end
-
   configuration = load_configuration(options[:config])
 
   execution_tree = build_configuration_tree(configuration, directory_list)
@@ -168,6 +164,11 @@ def parse_arguments
     $stderr.puts "Error: Failed while parsing command line arguments.  Check clarisse --help."
     $stderr.puts e
     abort
+  end
+
+  if arguments[:version]
+    puts "Clarisse #{PROGRAM_VERSION}"
+    exit 
   end
 
   ### Mandatory arguments [[[

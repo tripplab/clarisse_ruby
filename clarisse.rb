@@ -104,11 +104,6 @@ end
 
 
 def parse_arguments
-  defaults = {
-    threads: 1,
-    verbose: false
-  }
-
   ### Define command line options [[[
   arguments = {}
   # *parser* holds the definition of the command line arguments to be used by the module OptionParser
@@ -171,28 +166,35 @@ def parse_arguments
     exit 
   end
 
+  # Combine default options before validation
+  defaults = {
+    threads: 1,
+    verbose: false
+  }
+  combined_options = defaults.merge(arguments)
+
   ### Mandatory arguments [[[
-  if not arguments[:config]
+  if not combined_options[:config]
     abort "Error: Configuration file was not specified."
   end
 
-  if arguments[:threads] < 1
+  if combined_options[:threads] < 1
     abort "Error: Invalid number of threads."
   end
   ### ]]]
 
   ### Verify files and directories exist [[[
-  if not File.exist? arguments[:config]
-    abort "Error: File not found: #{arguments[:config]}."
-  elsif not File.readable? arguments[:config]
-    abort "Error: Failed to open file: #{arguments[:config]}."
+  if not File.exist? combined_options[:config]
+    abort "Error: File not found: #{combined_options[:config]}."
+  elsif not File.readable? combined_options[:config]
+    abort "Error: Failed to open file: #{combined_options[:config]}."
   end
 
-  if arguments[:template]
-    if not File.exist? arguments[:template] 
-      abort "Error: File not found: #{arguments[:template]}."
-    elsif not File.readable? arguments[:template]
-      abort "Error: Failed to open file: #{arguments[:template]}."
+  if combined_options[:template]
+    if not File.exist? combined_options[:template]
+      abort "Error: File not found: #{combined_options[:template]}."
+    elsif not File.readable? combined_options[:template]
+      abort "Error: Failed to open file: #{combined_options[:template]}."
     end
   end
 
@@ -229,8 +231,7 @@ def parse_arguments
     COLUMN_ALIGNMENT_TITLE 
   ].max_by(&:length).length 
 
-
-  return defaults.merge(arguments), directory_list
+  return combined_options, directory_list
 end
 
 

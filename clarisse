@@ -131,21 +131,13 @@ def parse_arguments
   arguments = {}
   # *parser* holds the definition of the command line arguments to be used by the module OptionParser
   parser = OptionParser.new do |options|
-    options.banner  = "Usage: clarisse OPTIONS DIR..."
+    options.banner  = "Usage: clarisse [--threads N] [--preview] [--template FILE]  CONFIGURATION_FILE  ALIGNMENT_DIRECTORY [...]\n\n"
 
-    #options.on("-e", "--existing FILE", "Run codeml once on every DIR. FILE must already exist inside every DIR and will be used as control file.") do |path|
-    #  arguments[:existing] = path
-    #end
-
-    options.on("-c", "--config FILE", "FILE will be parsed to determine the number of iterations and their options on every dir *Mandatory*") do |path|
-      arguments[:config] = path
-    end
-
-    options.on("--template FILE", "The contents of FILE will be appended to the dynamically generated control file.") do |path|
+    options.on("-t", "--template TEMPLATE", "The contents of FILE will be appended to the dynamically generated control file.") do |path|
       arguments[:template] = path
     end
 
-    options.on("-t", "--threads N", "Number of threads in which to initially divide the workload.") do |n|
+    options.on("-T", "--threads NUM_THREADS", "Number of threads in which to initially divide the workload.") do |n|
       arguments[:threads] = n.to_i
     end
 
@@ -175,7 +167,7 @@ def parse_arguments
   # Execute the actual parsing and catch exceptions in case of invalid or incomplete options
   begin parser.parse!
   rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
-    $stderr.puts "Error: Failed while parsing command line arguments.  Check clarisse --help."
+    $stderr.puts "Error: failed while parsing command line arguments.  Check clarisse --help"
     $stderr.puts e
     abort
   end
@@ -185,6 +177,10 @@ def parse_arguments
     exit 
   end
 
+  if ARGV.length < 2
+    abort "Error: wrong number of arguments"
+  end
+
   # Combine default options before validation
   defaults = {
     threads: 1,
@@ -192,32 +188,30 @@ def parse_arguments
   combined_options = defaults.merge(arguments)
 
   ### Mandatory arguments [[[
-  if not combined_options[:config]
-    abort "Error: Configuration file was not specified."
-  end
-
   if combined_options[:threads] < 1
-    abort "Error: Invalid number of threads."
+    abort "Error: invalid number of threads"
   end
   ### ]]]
 
+  combined_options[:config] = ARGV.first
+  directory_list = ARGV[1 .. -1]
+
   ### Verify files and directories exist [[[
   if not File.exist? combined_options[:config]
-    abort "Error: File not found: #{combined_options[:config]}."
+    abort "Error: file not found: #{combined_options[:config]}"
   elsif not File.readable? combined_options[:config]
-    abort "Error: Failed to open file: #{combined_options[:config]}."
+    abort "Error: failed to open file: #{combined_options[:config]}"
   end
 
   if combined_options[:template]
     if not File.exist? combined_options[:template]
-      abort "Error: File not found: #{combined_options[:template]}."
+      abort "Error: file not found: #{combined_options[:template]}"
     elsif not File.readable? combined_options[:template]
-      abort "Error: Failed to open file: #{combined_options[:template]}."
+      abort "Error: failed to open file: #{combined_options[:template]}"
     end
   end
 
 
-  directory_list = ARGV
   if directory_list.empty?
     abort "Error: No list of directories was provided."
   end

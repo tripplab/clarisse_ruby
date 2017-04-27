@@ -22,179 +22,622 @@
 require 'open3'
 require 'optparse'
 require 'pathname'
-require 'pp'
-require 'fileutils'
-require 'json'
-require 'yaml'
 
+CLARISSE_VERSION  = "2.1.0"
 
-CLARISSE_VERSION       = "2.0.2"
-
-PROGRAM = "codeml"
-
-CONFIG_FILE_MARKER    = "="
-CONFIG_FILE_SEPARATOR = "->"
-CONFIG_FILE_POINTERS  = ["seqfile", "treefile"]
-
-CONTROL_FILE_START    = " *** START OF DYNAMICALLY GENERATED OPTIONS ***"
-CONTROL_FILE_END      = " *** END OF DYNAMICALLY GENERATED OPTIONS ***"
-CONTROL_FILE_ALIGN    = 13
-
-FILE_COMMON_PREFIX    = "_"
-FILE_ITERATION_PREFIX = FILE_COMMON_PREFIX + "iteration_"
-FILE_CONTROL_SUFFIX   = ".control"
-FILE_STDOUT_SUFFIX    = ".stdout"
-FILE_STDERR_SUFFIX    = ".stderr"
-
-HEADER_EXECUTION      = "# Execution started"
-HEADER_ERROR_LIST     = "# Error report"
-
-COLUMN_SPACING          = " " * 5
-COLUMN_ALIGNMENT_TITLE  = "Alignment"
-COLUMN_ITERATION_TITLE  = "Iteration"
-COLUMN_ITERATION_WIDTH  = COLUMN_ITERATION_TITLE.length
-COLUMN_TIME_TITLE       = "Running time (n/N)"
-COLUMN_TIME_WIDTH       = COLUMN_TIME_TITLE.length
-COLUMN_QUEUE_TITLE      = "Thread"
-COLUMN_QUEUE_WIDTH      = COLUMN_QUEUE_TITLE.length
-COLUMN_DIRS_TITLE       = "Alignments"
-COLUMN_DIRS_WIDTH       = COLUMN_DIRS_TITLE.length
-
-FAILURE_TIME_THRESHOLD = 5
-COLUMN_FAILURE_SOURCE_TITLE = "During"
-COLUMN_FAILURE_SOURCE = {
-  clarisse: "Clarisse execution",
-  codeml:   "Codeml execution"
-}
-COLUMN_FAILURE_SOURCE_WIDTH = COLUMN_FAILURE_SOURCE.values.max_by(&:length).length
-COLUMN_FAILURE_REASON_TITLE = "Reason"
-COLUMN_FAILURE_REASON_WIDTH = [COLUMN_FAILURE_REASON_TITLE.length, 20].max
-
-COLUMN_EVENT_TITLE      = "Status"
-COLUMN_EVENT_START      = "Started"
-COLUMN_EVENT_SUCCESS    = "Finished"
-COLUMN_EVENT_FAILURE    = "FAILED"
-COLUMN_EVENT_WIDTH      = [
-  COLUMN_EVENT_START,
-  COLUMN_EVENT_SUCCESS,
-  COLUMN_EVENT_FAILURE,
-  COLUMN_EVENT_TITLE
-].max_by(&:length).length
-
-REGEX_ERROR_DETECTION = /^Error.*/
-REGEX_KNOWN_ERRORS = [
-  /^Error in sequence data file/,
-  /^Error:/
-]
-REGEX_EXTRACTION  = /^#{CONFIG_FILE_MARKER}\s*(?<iter>[[:digit:]]+)\s*#{CONFIG_FILE_SEPARATOR}\s*(?<key>[[:alnum:]]+)\s*$/
-
-# TODO: Add better descriptions
-HELP_SHORT = <<-EOF
-Clarisse is a script that automates the execution of codeml over a number of directories. It can copy or generate the necessary control files and then use them to execute codeml.
-EOF
-
-HELP_LONG = <<-EOF
-Control files will be created dynamically...
-
-EXPANSION RULES
-
-EOF
-
-class ClarisseError < StandardError; end
-class CodemlError  < StandardError; end
-@failed_directories = []
-@mutex = Mutex.new
-
+### General program workflow is encapsulated here
 def clarisse_main
-  options, directory_list = parse_arguments()
+  ### Parse and validate command-line options
+  begin
+    config = read_config()
+  rescue CommandLineError => e
+    $stderr.puts "Invalid command line options:"
+    $stderr.puts SPACING + e.to_s
+    exit(E_CONFIG)
+  end
 
-  configuration = load_configuration(options[:config])
 
-  execution_tree = build_configuration_tree(configuration, directory_list)
-  execution_tree = resolve_filenames(execution_tree)
+  ### If the version was requested, print it and exit
+  if config[:version]
+    puts "Clarisse #{CLARISSE_VERSION}"
+    exit true
+  end
 
-  queues = distribute_workload(execution_tree, options[:threads])
 
-  if options[:preview]
-    preview_execution(execution_tree, options, queues)
+  ### Read and validate control file
+  begin
+    iterations = read_control_file()
+  rescue ControlFileError => e
+    $stderr.puts "Problem reading control file"
+    $stderr.puts SPACING + "File:    #{e.file}"     if not e.file.nil?
+    $stderr.puts SPACING + "Line:    #{e.line}"     if not e.line.nil?
+    $stderr.puts SPACING + "Section: #{e.section}"  if not e.section.nil?
+    $stderr.puts SPACING + "Error:   #{e.message}"
+    exit(E_CTRLFILE)
+  end
+
+  ### Read and validate directories
+  begin
+    directories = read_directories()
+  rescue DirectoryError => e
+    $stderr.puts "Problem reading directory list"
+    $stderr.puts SPACING + "Error:   #{e.message}"
+    exit(E_DIR)
+  end
+
+
+  ### Combine the directories with the iteration options from the control file
+  ### to generate the actual options for each directory/iteration
+  execution_list = Array.new
+  begin
+    directories.each do |directory|
+      execution_list.push(ExecutionPoint.new(directory, iterations))
+    end
+  rescue FileResolutionError => e
+    $stderr.puts "Problem resolving filename"
+    $stderr.puts SPACING + "Execution Point:  #{e.execution_point}"
+    $stderr.puts SPACING + "Path:   #{e.path}"
+    $stderr.puts SPACING + "Error:  #{e.message}"
+    exit(E_FILERES)
+  end
+
+
+  ### Prepare each directory for execution
+  begin
+    execution_list.each do |execution_point|
+      execution_point.setup
+    end
+  rescue SetupError => e
+    $stderr.puts SPACING + "Error:  #{e.message}"
+    exit(E_SETUP)
+  end
+
+
+  ### Did the user just asked for a preview?
+  if config[:preview]
+    preview_execution(execution_list, config)
     exit
   end
 
-  begin_execution(queues, options)
-  summarize(options)
-  exit
+
+  ### Preparation is done. Starting execution
+  # From this point on, exceptions should be catched and rescued, since a failure
+  # in one of the directories should not stop execution in another.
+
+  print_execution_header()
+
+  # Split the execution points into queues for parallel execution
+  queues = enqueue(execution_list, config[:threads])
+  threads = Array.new
+  queues.each do |workload|
+    # The *run* method of every execution point performs the actual work
+    threads << Thread.new{ workload.each {|e| e.run} }
+  end
+  threads.each {|thread| thread.join}
+
+
+  ### Error checking
+  # Make a flat array again for simples error checking
+  execution_list = queues.flatten
+  if execution_list.any? {|e| e.failed?}
+    # If any of the directories failed, we print an error report
+    puts
+    print_error_header()
+
+    execution_list.select{|e| e.failed?}.each do |execution_point|
+      error = execution_point.error
+      print_error_row(
+        error.sequence,
+        error.iteration,
+        error.type,
+        error.message
+      )
+    end
+
+    # Return a different value depending on if every directory failed
+    if execution_list.all? {|e| e.failed?}
+      exit(E_ALLFAIL)
+    else
+      exit(E_SOMEFAIL)
+    end
+  end
+
+  exit(true)
 end
 
 
-def parse_arguments
-  ### Define command line options [[[
-  arguments = {}
-  # *parser* holds the definition of the command line arguments to be used by the module OptionParser
-  parser = OptionParser.new do |options|
-    options.banner  = "Usage: clarisse [--threads N] [--preview] [--template FILE]  CONFIGURATION_FILE  ALIGNMENT_DIRECTORY [...]\n\n"
+CLARISSE_DIR = "__clarisse"
+PROGRAM = "codeml"
 
-    options.on("-t", "--template TEMPLATE", "The contents of FILE will be appended to the dynamically generated control file.") do |path|
-      arguments[:template] = path
-    end
+FILE_POINTERS     = ["seqfile", "treefile"]
+MANDATORY_OPTIONS = ["outfile"] + FILE_POINTERS
 
-    options.on("-T", "--threads NUM_THREADS", "Number of threads in which to initially divide the workload.") do |n|
-      arguments[:threads] = n.to_i
-    end
+### Failure return values and exception definition [[[
+TIME_THRESHOLD = 1
 
-    options.on("-p", "--preview", "Don't execute codeml, but parse and validate options and present a preview of what would be executed.") do |n|
-      arguments[:preview] = true
-    end
+E_CONFIG    = 1
+E_CTRLFILE  = 3
+E_DIR       = 5
+E_FILERES   = 7
+E_SETUP     = 9
+E_SOMEFAIL  = 23
+E_ALLFAIL   = 25
 
-    options.on("-d", "--debug") do |n|
-      arguments[:debug] = true
-    end
 
-    options.on("-V", "--version", "Print Clarisse's version number.") do |n|
-      arguments[:version] = true
-    end
+class ClarisseError    < StandardError; end
+class CommandLineError < ClarisseError; end
+class SetupError       < ClarisseError; end
+class DirectoryError   < ClarisseError; end
 
-    options.on("-h", "--help", "Print this screen") do
-      puts HELP_SHORT
-      puts
-      puts options
-      puts
-      puts HELP_LONG
-      exit
+class ExecutionError < ClarisseError
+  attr_reader :name, :iteration, :type
+  def initialize(msg, name, iteration, type)
+    @name = name
+    @iteration = iteration
+    @type = type
+    super(msg)
+  end
+end
+
+class Error
+  attr_reader :sequence, :iteration, :type, :message
+  def initialize(sequence, iteration, type, message)
+    @sequence   = sequence
+    @iteration  = iteration
+    @type       = type
+    @message    = message
+  end
+end
+
+class ControlFileError < ClarisseError
+  attr_reader :file, :line, :section
+  def initialize(msg="Unknown error", file=nil, line=nil, section=nil)
+    @file = file
+    @line = line
+    @section = section
+    super(msg)
+  end
+end
+
+class FileResolutionError < ClarisseError
+  attr_reader :execution_point, :path
+  def initialize(msg="Unknown error", execution_point=nil, path=nil)
+    @execution_point = execution_point
+    @path = path
+    super(msg)
+  end
+end
+### ]]]
+
+
+### Column headers and formatting
+SPACING          = " " * 5
+HEADER_PREVIEW    = "### Execution preview"
+HEADER_EXECUTION  = "### Execution started"
+HEADER_ALIGNMENT  = "Alignment"
+HEADER_ITERATION  = "Iter."
+HEADER_RUNTIME    = "Runtime"
+HEADER_ERRORS     = "### Error report"
+HEADER_RESULT     = "Result"
+HEADER_FAILURE_SOURCE = "During"
+HEADER_FAILURE_REASON = "Reason"
+
+RESULT_SUCCESS = "Finished"
+RESULT_FAILURE = "FAILED"
+VALUES_FAILURE_SOURCE = {
+  clarisse: "Clarisse execution",
+  codeml:   "Codeml execution"
+}
+
+WIDTH_ITERATION = HEADER_ITERATION.length
+WIDTH_FAILURE_SOURCE = VALUES_FAILURE_SOURCE.values.max_by(&:length).length
+WIDTH_RESULT = [
+  RESULT_SUCCESS,
+  RESULT_FAILURE,
+  HEADER_RESULT
+].max_by(&:length).length
+
+
+### Regular expressions [[[
+# Regex used to process Clarisse's control file
+NONCOMMENT = /^([^#]*)/
+HEADER  = /^[[:blank:]]*\[([1-9][[:digit:]]*|\*)\][[:blank:]]*$/
+OPTION  = /^[[:blank:]]*([_[:alnum:]]+)[[:blank:]]*=[[:blank:]]*([[:print:]]+?)[[:blank:]]*$/
+OPTION_EXTRACT = /^[[:blank:]]*\[([1-9][[:digit:]]*)\][[:blank:]]*$/
+
+# This is what Clarisse knows how to extract from codeml's results
+KNOWN_EXTRACTIONS = {
+  "kappa" =>  /^kappa \(ts\/tv\) =\s*([^ ]+)/,
+}
+
+# This is what Clarisse knows as an error printed by codeml
+KNOWN_ERRORS = [
+  /^Error in sequence data file/,
+  /^option .* not recognised$/,
+  /^Error:/,
+]
+### ]]]
+
+
+class Option
+  attr_reader   :name
+  attr_accessor :value
+  @@longest_name = 0
+
+  def initialize(name, value)
+    @name   = name
+    @value  = value
+    if name.length > @@longest_name
+      @@longest_name = name.length
     end
   end
-  ### ]]]
 
+  class << self
+    def longest_name
+      @@longest_name
+    end
+  end
+
+  def to_s
+    @name.rjust(@@longest_name + 1) + " = " + @value
+  end
+end
+
+
+class Extraction
+  attr_reader :name, :source, :pattern
+  def initialize(name, source)
+    @name     = name
+    @source   = source
+    @pattern  = /#{name}/
+  end
+
+  def to_s
+    @name.rjust(Option.longest_name + 1) + " = [obtained from iteration #{@source}]"
+  end
+end
+
+
+class Iteration
+  attr_accessor :options, :extractions
+  attr_reader   :number, :outfile, :control
+  @@longest_name = 10
+
+  def initialize(number, options=[], extractions=[])
+    @number       = number
+    @options      = options
+    @extractions  = extractions
+  end
+
+  class << self
+    def longest_name
+      @@longest_name
+    end
+  end
+
+  def duplicate? (name)
+    if @options.any? {|o| o.name == name} or @extractions.any? {|e| e.name == name}
+      return true
+    else
+      return false
+    end
+  end
+
+  def empty?
+    return @options.empty? && @extractions.empty?
+  end
+
+  def missing_any?
+    MANDATORY_OPTIONS.any? do |mandatory|
+      @options.none? {|option| option.name == mandatory}
+    end
+  end
+
+  def missing
+    names = @options.collect {|option| option.name}
+    MANDATORY_OPTIONS.select do |mandatory|
+      not names.include? mandatory
+    end
+  end
+
+  def add (new_elem)
+    if new_elem.is_a? Option
+      if not self.duplicate? new_elem.name
+        @options.push(new_elem)
+        if new_elem.name.length > @@longest_name
+          @@longest_name = new_elem.name.length
+        end
+      end
+    elsif new_elem.is_a? Extraction
+      if not self.duplicate? new_elem.name
+        @extractions.push(new_elem)
+      end
+    elsif new_elem.is_a? Array
+      new_elem.each {|e| self.add(e)}
+    end
+  end
+
+  def to_s
+    s  = String.new
+    @options.each {|option| s += "#{option}\n"}
+    return s
+  end
+end
+
+
+class ExecutionPoint
+  attr_reader :iterations, :name, :path, :error
+  @@longest_name = 0
+  @@mutex = Mutex.new
+
+  def initialize(name, iteration_options)
+    @error  = nil
+    @name   = name
+
+    if name.length > @@longest_name
+      @@longest_name = name.length
+    end
+
+    tmp_path = Pathname.new(name)
+    if tmp_path.absolute?
+      @path = tmp_path
+    else
+      @path = Pathname.new(Dir.getwd).join(tmp_path)
+    end
+
+    @iterations = Hash.new
+    iteration_options.each do |i|
+      @iterations[i.number] = Marshal.load(Marshal.dump(i))
+    end
+
+    @iterations.each do |n, iteration|
+      iteration.options.each do |option|
+        # Resolve file paths
+        if FILE_POINTERS.include? option.name
+          path = Pathname.new(option.value)
+          if not path.absolute?
+            path = @path.join(path)
+          end
+
+          matches = Dir.glob(path)
+          if matches.empty?
+            raise FileResolutionError.new("File not found", @name, path)
+          end
+
+          if matches.length > 1
+            raise FileResolutionError.new(
+              "Path matches #{matches.length} different files", @name, path
+            )
+          end
+
+          option.value = matches.first
+        end
+      end
+
+      # Expand outfile value, if necessary
+      outfile_option = iteration.options.select {|o| o.name == "outfile"}.first
+      outfile_path = Pathname.new(outfile_option.value)
+      if not outfile_path.absolute?
+        outfile_option.value = @path.join(outfile_path).to_s
+      end
+
+    end
+  end
+
+  class << self
+    def longest_name
+      @@longest_name
+    end
+  end
+
+  ### At this moment the only step executed here is to create Clarisse's execution
+  ### sub-directory on each of the received directories
+  def setup
+    @clarisse_dir = @path.join(CLARISSE_DIR)
+    if File.exists? @clarisse_dir 
+      if not File.directory? @clarisse_dir
+        raise SetupError.new (
+          "Could not create directory #{@clarisse_dir}. A file with that name " +
+          "already exists."
+        )
+      elsif not File.readable? @clarisse_dir or not File.writable? @clarisse_dir
+        raise SetupError.new (
+          "Clarisse has not enough permissions to write to '#{@clarisse_dir}'"
+        )
+      end
+    else
+      begin
+        Dir.mkdir(@clarisse_dir)
+      rescue SystemCallError => e
+        raise SetupError, "Failed to create directory '#{@clarisse_dir}'"
+      end
+    end
+  end
+
+
+  def run
+    output_files = Hash.new
+    @iterations.each do |n, iteration_options|
+      begin
+        if n > 1
+          # Resolve extractions
+          while not iteration_options.extractions.empty?
+            extraction = iteration_options.extractions.shift
+            outfile_path = @iterations[extraction.source].options.select{|o| o.name == "outfile"}.first
+
+            if outfile_path.nil?
+              raise ExecutionError.new(
+                "Clarisse doesn't know what's the outfile for iteration #{extraction.source}",
+                @name, n, :clarisse
+              )
+            end
+
+            begin
+              outfile = IO.read(outfile_path.value)
+            rescue SystemCallError => e
+              raise ExecutionError.new(
+                "Failed to read outfile on path '#{outfile_path.value}'. Error: #{e.message}",
+                @name, n, :clarisse
+              )
+            end
+
+            if KNOWN_EXTRACTIONS[extraction.name].nil?
+              raise ExecutionError.new(
+                "Clarisse does not know how to extract '#{extraction.name}'",
+                @name, n, :clarisse
+              )
+            end
+
+            match = nil
+            outfile.each_line do |line|
+              if KNOWN_EXTRACTIONS[extraction.name].match(line)
+                match = KNOWN_EXTRACTIONS[extraction.name].match(line).captures.first
+              end
+            end
+
+            if match.nil?
+              raise ExecutionError.new(
+                "Did not find '#{extraction.name}' in file '#{outfile_path.value}'",
+                @name, n, :clarisse
+              )
+            end
+
+            iteration_options.add(Option.new(extraction.name, match))
+
+          end
+        end
+
+        stdout_path  = @clarisse_dir.join(n.to_s + ".stdout")
+        stderr_path  = @clarisse_dir.join(n.to_s + ".stderr")
+        control_path = @clarisse_dir.join(n.to_s + ".ctl")
+
+        len = IO.write(control_path, iteration_options.to_s)
+        if len != iteration_options.to_s.length
+          raise ExecutionError.new(
+            "Control file could not be fully written to '#{control}'",
+            @name, n, :clarisse
+          )
+        end
+
+        command = "cd #{@path}; #{PROGRAM} #{control_path}"
+
+        start_time = Time.now
+        stdout, stderr, exit_status = Open3.capture3(command)
+        runtime = Time.now - start_time
+
+        output_error  = String.new
+
+        IO.write(stdout_path, stdout) if not stdout.empty?
+        IO.write(stderr_path, stderr) if not stderr.empty?
+
+        [stderr, stdout].each do |output|
+          output.each_line do |line|
+            KNOWN_ERRORS.each do |error|
+              if error.match(line)
+                output_error = 'Error found in output: "' + line.rstrip + '"'
+              end
+            end
+          end
+        end
+
+        if runtime < TIME_THRESHOLD
+          too_fast = true
+          if output_error.empty?
+            output_error = "Codeml took less than #{TIME_THRESHOLD} seconds to run. Considered as failed."
+          end
+        end
+
+        if not exit_status.success? or not output_error.empty? or too_fast
+          raise ExecutionError.new(
+            output_error,
+            @name, n, :codeml
+          )
+        else
+          # Iteration finished successfully
+          @@mutex.synchronize {
+            print_execution_row(@name, n, RESULT_SUCCESS, Time.at(runtime).strftime("%M:%S"))
+          }
+        end
+
+      rescue ExecutionError => e
+        @@mutex.synchronize { print_execution_row(@name, n, RESULT_FAILURE) }
+        @error = Error.new(@name, n, e.type, e.message)
+        break
+      end
+    end
+  end
+
+  def failed?
+    @error != nil
+  end
+  #def pretty_print(pp)
+  #  pp.text "### #{@name} ###\n"
+  #  pp.text "  Path: #{@path}\n"
+  #  pp.text "  Iterations: #{@iterations.length}\n"
+  #  @iterations.each do |n, iteration|
+  #    pp.text iteration.to_s
+  #  end
+  #end
+end
+
+
+# *parser* holds the definition of the command line arguments to be used by the module OptionParser
+@defaults = {
+  threads: 1,
+}
+@parser_values = {}
+@parser = OptionParser.new do |options|
+  options.banner  = "Usage: clarisse [--threads N] [--preview] [--template FILE]  CONFIGURATION_FILE  ALIGNMENT_DIRECTORY [...]\n\n"
+
+  options.on("-t", "--threads NUM_THREADS", "Number of threads in which to initially divide the workload.") do |n|
+    @parser_values[:threads] = n.to_i
+  end
+
+  options.on("-p", "--preview", "Don't execute codeml, but parse and validate options and present a preview of what would be executed.") do |n|
+    @parser_values[:preview] = true
+  end
+
+  options.on("-d", "--debug") do |n|
+    @parser_values[:debug] = true
+  end
+
+  options.on("-V", "--version", "Print Clarisse's version number.") do |n|
+    @parser_values[:version] = true
+  end
+
+  options.on("-h", "--help", "Print this screen") do
+    puts HELP_SHORT
+    puts
+    puts options
+    puts
+    puts HELP_LONG
+    puts
+    puts HELP_CONTROL_FILE.squeeze(" ")
+    puts
+    exit
+  end
+end
+
+def read_config
   # Execute the actual parsing and catch exceptions in case of invalid or incomplete options
-  begin parser.parse!
+  begin @parser.parse!
   rescue OptionParser::InvalidOption, OptionParser::MissingArgument => e
-    $stderr.puts "Error: failed while parsing command line arguments.  Check clarisse --help"
-    $stderr.puts e
-    abort
-  end
-
-  if arguments[:version]
-    puts "Clarisse #{CLARISSE_VERSION}"
-    exit 
-  end
-
-  if ARGV.length < 2
-    abort "Error: wrong number of arguments"
+    raise CommandLineError, e.message
   end
 
   # Combine default options before validation
-  defaults = {
-    threads: 1,
-  }
-  combined_options = defaults.merge(arguments)
+  options = @defaults.merge(@parser_values)
 
   ### Mandatory arguments [[[
-  if combined_options[:threads] < 1
+  if options[:threads] < 1
     abort "Error: invalid number of threads"
   end
   ### ]]]
 
-  combined_options[:config] = ARGV.first
-  directory_list = ARGV[1 .. -1]
+  return options
+
+  #combined_options[:config] = ARGV.first
+  #directory_list = ARGV[1 .. -1]
 
   ### Verify files and directories exist [[[
   if not File.exist? combined_options[:config]
@@ -240,468 +683,351 @@ def parse_arguments
   # Find the largest string among the directory names and its column header
   @column_alignment_width = [
     directory_list.max_by(&:length),
-    COLUMN_ALIGNMENT_TITLE 
+    HEADER_ALIGNMENT 
   ].max_by(&:length).length 
 
   return combined_options, directory_list
 end
 
 
-def load_configuration(configuration_file)
-  if not File.exist? configuration_file
-    abort "Error: File #{configuration_file} does not exist."
+def preview_execution(execution_list, config)
+  puts HEADER_PREVIEW + "\n\n"
+
+  dir_number = execution_list.length
+  dir_label = if dir_number == 1 then "directory" else "directories" end
+  iter_number = execution_list.first.iterations.length
+
+  puts "Clarisse will execute #{PROGRAM} #{iter_number} times on #{dir_number} #{dir_label}."
+  puts
+
+  puts "################  FILENAME RESOLUTION  ################"
+  puts
+  puts "The provided configuration file and execution directories resolved to the paths below."
+  puts
+
+  files = ["seqfile", "treefile", "outfile"]
+  width = files.max_by(&:length).length
+  execution_list.each do |e|
+    puts e.name
+    e.iterations.each do |n, iteration_options|
+      puts "  Iteration #{n}"
+      files.each do |file|
+        path = iteration_options.options.select{|o| o.name == file}.first.value
+        print "    " + file.ljust(width) + ":  "
+        puts path
+      end
+      puts if iteration_options.number < iter_number
+    end
+    puts
   end
 
-  # Try to read and parse the file as YAML
-  begin
-    iterations = YAML::load_file(configuration_file)
-  rescue Psych::SyntaxError => e
-    abort "Error: #{configuration_file} contains invalid YAML syntax."
-    puts e
-  rescue Exception => e
-    abort "Error: Unknown problem while reading file #{configuration_file}."
-    puts e
+  iterations = execution_list.first.iterations
+  puts
+  puts "################    COMMON OPTIONS    ################"
+  puts
+  iterations.each do |n, iteration_options|
+    puts "    " + "* Iteration #{n} *".rjust(Option.longest_name)
+    iteration_options.extractions.each do |extraction|
+      puts extraction.to_s
+    end
+
+    iteration_options.options.select{|o| not files.include? o.name}.each do |option|
+      puts option.to_s
+    end
+    puts if iteration_options.number < iter_number
+  end
+end
+
+
+
+def read_control_file
+  if ARGV.length < 1
+    raise ControlFileError, "No control file was specified"
   end
 
-  ### Validate general structure [[[
-  if not iterations.is_a? Hash
-    abort "Error: #{configuration_file} is not properly structured. See the " \
-          "documentation for help." 
+  options_file = ARGV.shift
+  if not File.exist? options_file
+    raise ControlFileError, "File '#{options_file}' does not exist"
   end
 
-  if not iterations.keys.all? {|key| key.is_a? Integer}
-    abort "Error: #{configuration_file}: iterations options are not grouped " \
-          "by iteration number."
+  if not File.readable? options_file
+    raise ControlFileError, "Failed to read file '#{options_file}'. Do you have enough permissions?"
   end
 
-  if not iterations.keys.first == 1
-    abort "Error: #{configuration_file}: iteration numbers don't start from 1."
+  if not File.file? options_file
+    raise ControlFileError, "File '#{options_file}' doesn't seem to be a valid file"
   end
 
-  if not iterations.keys.each_cons(2).all? {|a,b| b = a + 1}
-    abort "Error: In file #{configuration_file}, iteration numbers must be "  \
-          "continuous."
-  end
-  ### ]]]
+  iterations      = []
+  iteration       = nil
+  common_options  = []
 
-  ### Validate syntax for every option [[[
-  iterations.each do |iteration, options|
-    options.each do |key, value|
-      # Exit if there are strange options
-      # TODO: Validate there are no empty values?
-      # TODO: Restrict the valid characters strings to a limited set
-      if not (value.is_a? String or value.is_a? Numeric)
-        abort "Error: #{configuration_file}|#{iteration}:#{key}: Invalid value"
+  ### Initial state
+  expects     = :first_header   # Valid states: first_header, option, any
+  reading     = :iterations     # Valid states: iterations, common_options
+  line_number = 0               # Line number
+
+  File.read(options_file).each_line do |line|
+    line_number += 1
+    line = NONCOMMENT.match(line).captures.first
+    if line.lstrip.empty?
+      next
+    end
+
+    if HEADER.match(line)
+      next_section = HEADER.match(line).captures.first
+
+      if expects.eql? :option
+        if reading.eql? :common_options
+          if next_section == "*"
+            raise ControlFileError.new(
+              "Duplicate section [*]",
+              options_file, line_number
+            )
+          else
+            raise ControlFileError.new(
+              "Numbered sections cannot appear after section [*]",
+              options_file, line_number
+            )
+          end
+          
+        else # (reading :iterations)
+          raise ControlFileError.new(
+            "Section [#{i}] contains no options",
+            options_file, line_number
+          )
+        end
+        break
       end
 
+      if next_section == "*"
+        reading = :common_options
+        expects = :option
+        next
+      end
 
-      # If the key starts with CONFIG_FILE_MARKER, there is more checking to do
-      if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
-        # Validate option is not empty
-        if value.length.eql? 1
-          abort "Error: #{configuration_file}|#{iteration}/#{key}: missing "  \
-                "value after #{CONFIG_FILE_MARKER}." 
+      next_iteration_id = next_section.to_i
+
+      if expects.eql? :first_header
+        if not next_iteration_id.eql? 1
+          raise ControlFileError.new(
+            "Iterations don't start with 1",
+            options_file, line_number
+          )
         end
+      elsif not next_iteration_id == iteration.number + 1
+        raise ControlFileError.new(
+          "Section [#{iteration.number}] is followed by [#{next_iteration_id}]",
+          options_file, line_number
+        )
+      end
 
-        # If the option is not a file glob, it must be an extractor for a 
-        # previous iteration.  In that case, it must have the '=N->key' format,
-        # where N is the iteration number and key is the value to extract
-        if not CONFIG_FILE_POINTERS.include? key
-          if iteration == 1
-            abort "Error: #{configuration_file}|#{iteration}/#{key}: "        \
-                  "First iteration cannot include an extraction option."
-          end
+      if not iteration.nil?
+        iterations.push(iteration)
+      end
 
-          if not REGEX_EXTRACTION.match(value)
-            abort "Error: Invalid option in configuration file: #{value}."
-          end
+      iteration = Iteration.new(next_iteration_id)
+      expects = :option
+      next
 
-          source_iteration = REGEX_EXTRACTION.match(value)[:iter].to_i
-          if not source_iteration < iteration
-            abort "Error: Invalid option in configuration file: "             \
-                  "Iteration #{iteration} can't extract a result from "       \
-                  "iteration #{source_iteration}."
+    elsif OPTION.match(line)
+      if expects.eql? :first_header
+        raise ControlFileError.new(
+          "Options cannot appear outside a section",
+          options_file, line_number
+        )
+      end
+
+      name,value = OPTION.match(line).captures
+
+      if reading.eql? :iterations
+        if OPTION_EXTRACT.match(value)
+          source = OPTION_EXTRACT.match(value).captures.first.to_i
+          if source >= iteration.number
+            raise ControlFileError.new(
+              "Iteration [#{iteration.number}] cannot obtain a result from iteration [#{source}]",
+              options_file, line_number, iteration.number
+            )
           end
+          # TODO Resolve pattern
+          iteration.add(Extraction.new(name, source))
+        else
+          iteration.add(Option.new(name, value))
         end
+        expects = :any if expects != :any
+        
+      elsif reading.eql? :common_options
+        common_options.push( Option.new(name, value) )
+      end
+
+    else
+      if iteration.nil?
+        raise ControlFileError.new(
+          "Not a valid section header, option or comment",
+          options_file, line_number
+        )
+      else
+        raise ControlFileError.new(
+          "Not a valid section header, option or comment",
+          options_file, line_number, iteration.number
+        )
       end
     end
+
   end
+
+  ### Validate exit state [[[
+  if iteration.nil?
+    raise ControlFileError.new("No sections defined", options_file)
+  end
+
+  if iteration.empty?
+    raise ControlFileError.new(
+      "Section [#{iteration.number}] contains no options",
+      options_file, line_number, iteration.number
+    )
+  end
+  iterations.push(iteration)
   ### ]]]
+
+  # Append common options to every iteration
+  iterations.each {|i| i.add(common_options)}
+
+  # Check if any iteration is missing mandatory options
+  iterations.each do |iteration|
+    if iteration.missing_any?
+      # Turn the returned array into a formatted string
+      list = iteration.missing.map!{|m| "'#{m}'"}.join(", ")
+      raise ControlFileError.new(
+        "Missing mandatory options #{list}",
+        options_file, nil, iteration.number
+      )
+    end
+  end
 
   return iterations
 end
 
 
-def build_configuration_tree(configuration, directory_list)
-  iterations_tree = {}
-  directory_list.each do |directory|
-    iterations_tree[directory] = configuration
+def read_directories
+  if ARGV.length < 1
+    raise DirectoryError, "No directories were specified"
   end
-  return iterations_tree
+
+  directories = ARGV
+  directories.each do |directory|
+    if not File.exist? directory
+      raise DirectoryError, "Directory '#{directory}' does not exist"
+    end
+
+    if not File.readable? directory
+      raise DirectoryError, "Failed to read directory '#{directory}'. Do you have enough permissions?"
+    end
+
+    if not File.directory? directory
+      raise DirectoryError, "'#{directory}' is not a directory"
+    end
+  end
+
+  directories.map! {|directory| Pathname.new(directory).cleanpath.to_s}
+
+  return directories
 end
 
 
-def resolve_filenames(execution_tree)
-  execution_tree.each do |directory, iterations|
-    iterations.each do |iteration, options|
-      options.each do |key, value|
-        if CONFIG_FILE_POINTERS.include? key and value.start_with? CONFIG_FILE_MARKER
-          value = value[1..-1].lstrip
-          if Pathname.new(value).absolute?
-            files_found = Dir.glob(value)
-          else
-            files_found = Dir.glob(directory + "/" + value)
-          end
-          if files_found.none?
-            abort "Error: #{directory}/#{iteration}/#{key} = #{directory}/#{value}: File not found"
-          elsif not files_found.one?
-            abort "Error: #{directory}/#{iteration}/#{key} = #{directory}/#{value}: More than one file found"
-          else
-            relative_path = Pathname.new(files_found.first).relative_path_from(Pathname.new(directory)).to_s
-            execution_tree[directory][iteration][key] = relative_path
-          end
-        end
-      end
+def enqueue(directories, num_threads)
+  num_threads =  [directories.length, num_threads].min
+  queues = Array.new(num_threads) { Array.new }
+  i = 0
+
+  while not directories.empty?
+    queues[i].push(directories.shift)
+    if i == num_threads - 1
+      i = 0
+    else
+      i += 1
     end
-  end
-  return execution_tree
-end
-
-
-def preview_execution(execution_tree, options, queues)
-  puts "### Codeml will be executed on #{execution_tree.length} alignments, with #{execution_tree.first.length} iterations each."
-  puts "### The following options have been defined for each iteration and all supported file expansions have been resolved in relation to each alignment's directory:"
-  puts
-  execution_tree.each do |directory, iterations|
-    iterations.each do |iteration, options|
-      puts "# Alignment: #{directory} / Iteration: #{iteration}:"
-      options.each do |key, value|
-        if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
-          source_iteration = REGEX_EXTRACTION.match(value)[:iter]
-          value = "[extract from results of iteration #{source_iteration}]"
-        end
-        puts "#{key.to_s.rjust(CONTROL_FILE_ALIGN)} = #{value}"
-      end
-      puts
-    end
-  end
-
-  if options[:template]
-    puts
-    puts  "### In addition to the above options, the following template will be appended to each control file."
-    puts
-    begin
-      File.open(options[:template], "r") do |template|
-        template.each_line do |line|
-          puts line
-        end
-      end
-    rescue Exception => e
-      abort "Error: Failed to read template file #{options[:template]}"
-    end
-    puts
-  end
-
-  if options[:threads] > 1
-    puts
-    puts  "### Execution will be distributed among #{options[:threads]} threads, with the following per-thread workload:"
-    puts
-
-    header  = COLUMN_QUEUE_TITLE.ljust(COLUMN_QUEUE_WIDTH) + COLUMN_SPACING
-    header += COLUMN_DIRS_TITLE
-    puts header
-
-    queue_number = 1
-    queues.each_index do |queue|
-      queue_printed = false
-      queues[queue].keys.each do |directory|
-        if not queue_printed
-          line  = queue_number.to_s.center(COLUMN_QUEUE_WIDTH) + COLUMN_SPACING
-          line += directory.to_s
-          puts line
-          queue_printed = true
-        else
-          line = " ".ljust(COLUMN_QUEUE_WIDTH) + COLUMN_SPACING
-          line += directory.to_s
-          puts line
-        end
-      end
-      queue_number += 1
-      puts
-    end
-  else
-    puts  "### Execution will performed on a single thread."
-  end
-
-end
-
-
-### Process received options [[[
-def distribute_workload(execution_tree, threads)
-  directories_per_queue = (execution_tree.length/threads.to_f).ceil
-  queues = []
-  execution_tree.keys.each_slice(directories_per_queue) do |key_slice|
-    thread_queue = {}
-    key_slice.each do |key|
-      thread_queue[key] = execution_tree[key]
-    end
-    queues << thread_queue
   end
 
   return queues
 end
 
+def print_execution_row(sequence, iteration, result, time=nil)
+  msg  = sequence.ljust(ExecutionPoint.longest_name)  + SPACING
+  msg += iteration.to_s.ljust(WIDTH_ITERATION) + SPACING
+  msg += result.ljust(WIDTH_RESULT)             + SPACING
+  msg += time   if time != nil
 
-def begin_execution(queues, options)
-  puts HEADER_EXECUTION
-  puts
+  $stdout.puts msg
+end
 
-  ### Print headers [[[
-  header  = COLUMN_ALIGNMENT_TITLE.ljust(@column_alignment_width) + COLUMN_SPACING
-  header += COLUMN_ITERATION_TITLE.ljust(COLUMN_ITERATION_WIDTH)  + COLUMN_SPACING
-  header += COLUMN_EVENT_TITLE.ljust(COLUMN_EVENT_WIDTH)          + COLUMN_SPACING  
-  header += COLUMN_TIME_TITLE.ljust(COLUMN_TIME_WIDTH)
-  puts header
-  # ]]]
+def print_execution_header
+  puts HEADER_EXECUTION + "\n\n"
+  print_execution_row(
+    HEADER_ALIGNMENT,
+    HEADER_ITERATION,
+    HEADER_RESULT,
+    HEADER_RUNTIME
+  )
+end
 
-  threads = []
-  queues.each do |workload|
-    threads << Thread.new{ process_workload(workload, options) }
+def print_error_row(sequence, iteration, source, reason)
+  if source.is_a? String
+    source_text = source
+  else
+    source_text = VALUES_FAILURE_SOURCE[source]
   end
 
-  threads.each do |thread|
-    thread.join
-  end
+  msg  = sequence.ljust(ExecutionPoint.longest_name)    + SPACING
+  msg += iteration.to_s.ljust(WIDTH_ITERATION)   + SPACING
+  msg += source_text.ljust(WIDTH_FAILURE_SOURCE) + SPACING
+  msg += reason
+
+  $stderr.puts msg
+end
+
+def print_error_header
+  $stderr.puts HEADER_ERRORS + "\n\n"
+  print_error_row(
+    HEADER_ALIGNMENT,
+    HEADER_ITERATION,
+    HEADER_FAILURE_SOURCE,
+    HEADER_FAILURE_REASON
+  )
 end
 
 
-def process_workload(workload, options)
-  workload.each do |directory, iterations|
-    # Container with information on the current analysis
-    # TODO: Replace with a class
-    x = {}
-    # Store the absolute path
-    x[:path] = Pathname.new(directory).expand_path
+# TODO: Add better descriptions
+HELP_SHORT = <<-EOF
+Clarisse is a script that automates the execution of codeml over a number of directories. It can copy or generate the necessary control files and then use them to execute codeml.
+EOF
 
-    # Name to be used in progress prints
-    if directory.eql? "."
-      x[:name] = x[:path].basename.to_s
-    else
-      x[:name] = directory
-    end
+HELP_LONG = <<-EOF
+Control files will be created dynamically...
 
-    x[:files] = {}
-    x[:time_total] = 0
+EXPANSION RULES
 
-    begin
-      iterations.each do |i, iteration_options|
-        x[i] = {}
-        x[i][:control]  = x[:path] + make_filename(i, :control)
-        x[i][:stdout]   = x[:path] + make_filename(i, :stdout)
-        x[i][:stderr]   = x[:path] + make_filename(i, :stderr)
+EOF
 
-        x[i][:msg]  = x[:name].ljust(@column_alignment_width) + COLUMN_SPACING
-        x[i][:msg] += i.to_s.ljust(COLUMN_ITERATION_WIDTH) + COLUMN_SPACING
+HELP_CONTROL_FILE = <<-EOF
+OPTIONS FILE
 
-        ### Generate control file [[[
-        File.open(x[i][:control], 'w') do |file|
-          file.puts CONTROL_FILE_START
+This file describes the number of iterations and options used by Clarisse to run codeml on each DIRECTORY.
 
-          # If it starts with CONFIG_FILE_MARKER then parsing is required. Since glob
-          # expansion was done earlier, at this point we only care about extraction options
-          iteration_options.each do |key, value|
-            if value.is_a? String and value.start_with? CONFIG_FILE_MARKER
-              matches = REGEX_EXTRACTION.match(value)
-              if matches.size.eql? 0
-                raise ClarisseError, "Extraction expression \"#{value}\" could not be processed."
-              end
-              source, pattern = matches.captures
-              source = source.to_i
+General syntax:
+- Empty lines are allowed.
+- Non-empty lines must contain either a section header, an option or a comment.
+- Each option must contain one key/value pair separated by '='.
+- Comments begin with '#'.
+- Section headers must be enclosed in square brackets and must be either a positive integer or the character '*'.
+- The section header [1] is mandatory. If other numerical headers are to be used, they must follow [1] and be consecutive.
 
-              value = extract_value_from(pattern, x[source][:outfile])
+A section header marks the start of a section and subsequent options belong to that section until the next header is reached. Every option must appear inside a section and each section must contain at least one option. Each section with a numerical header defines an iteration. 
 
-              if value.nil?
-                raise ClarisseError, "Pattern #{pattern} not found in #{x[source][:outfile]}"
-              end
-            end
+Special option parsing
 
-            file.puts format_option(key, value)
-          end
-
-          file.puts CONTROL_FILE_END
-          file.puts
-
-          # If a template was specified, append its contents
-          if options[:template]
-            # TODO Load the template into memory at program start-up
-            File.open(options[:template]) do |template|
-              template.each_line do |line|
-                file.puts line
-              end
-            end
-          end
-        end
-        ### ]]]
-
-        # Examine the control file to get the outfile. If it's not an absolute path,
-        # append it to the directory's base and transform it into an absolute path.
-        x[i][:outfile] = Pathname.new(extract_value_from("outfile", x[i][:control]))
-        if not x[i][:outfile].absolute?
-          x[i][:outfile] = x[:path] + x[i][:outfile]
-        end
-
-        x[:command] = "cd #{x[:path]}; #{PROGRAM} #{x[i][:control]}"
-
-        ### Execution 
-        x[i][:time_start] = Time::now 
-        p_stdout, p_stderr, exit_status = Open3.capture3(x[:command])
-        x[i][:time_end] = Time::now
-
-        x[i][:time_total] = x[i][:time_end] - x[i][:time_start]
-        x[:time_total] += x[i][:time_total]
-
-        x[i][:codeml_issues] = ""
-
-        if not p_stdout.empty?
-          IO.write(x[i][:stdout], p_stdout)
-        end
-
-        if not p_stderr.empty?
-          IO.write(x[i][:stderr], p_stderr)
-        end
-
-        [p_stdout, p_stderr].each do |file|
-          file.each_line do |line|
-            REGEX_KNOWN_ERRORS.each do |error|
-              if error.match(line)
-                x[i][:codeml_issues] = "\"#{line.rstrip}\""
-              end
-            end
-          end
-        end
-
-        if x[i][:codeml_issues].empty?
-          if not exit_status.success?
-            x[i][:codeml_issues] = "Codeml returned a non-zero exit status (#{exit_status.exitstatus}), but Clarisse could not identify the error"
-          elsif x[i][:time_total] < FAILURE_TIME_THRESHOLD
-            x[i][:codeml_issues] = "Codeml completed execution in only #{x[i][:time_total]} seconds, which is less than the configured threshold of #{FAILURE_TIME_THRESHOLD}"
-          end
-        end
-
-        if not x[i][:codeml_issues].empty?
-          problem = {}
-          problem[:directory] = x[:name]
-          problem[:iteration] = i
-          problem[:source]  = :codeml
-          problem[:cause]   = x[i][:codeml_issues].lstrip
-          @failed_directories << problem
-          x[i][:msg] += COLUMN_EVENT_FAILURE
-          threaded_puts(x[i][:msg])
-          raise CodemlError
-        end
-        
-
-        x[i][:msg] += COLUMN_EVENT_SUCCESS.ljust(COLUMN_EVENT_WIDTH) + COLUMN_SPACING
-        x[i][:msg] += "#{human_readable_time(x[i][:time_total])} / #{human_readable_time(x[:time_total])}"
-        threaded_puts(x[i][:msg])
-      end
-
-    rescue ClarisseError, CodemlError => e
-      next
-    rescue Exception => e
-      threaded_puts "Unknown error during execution of Clarisse. Aborting..."
-      threaded_puts e.message + "\n" + e.backtrace.join("\n")
-      abort
-    end
-  end
-end
-
-def summarize(options)
-  # Summarize failures, if any
-  if @failed_directories.any?
-    puts "\n" * 3
-    puts HEADER_ERROR_LIST
-    puts
-
-    header  = COLUMN_ALIGNMENT_TITLE.ljust(@column_alignment_width) + COLUMN_SPACING
-    header += COLUMN_ITERATION_TITLE.ljust(COLUMN_ITERATION_WIDTH)  + COLUMN_SPACING
-    header += COLUMN_FAILURE_SOURCE_TITLE.ljust(COLUMN_FAILURE_SOURCE_WIDTH)      + COLUMN_SPACING
-    header += COLUMN_FAILURE_REASON_TITLE.ljust(COLUMN_FAILURE_REASON_WIDTH)      + COLUMN_SPACING
-    puts header
-
-    @failed_directories.each do |directory|
-      line  = directory[:directory].ljust(@column_alignment_width)      + COLUMN_SPACING
-      line += directory[:iteration].to_s.ljust(COLUMN_ITERATION_WIDTH)  + COLUMN_SPACING
-      line += COLUMN_FAILURE_SOURCE[directory[:source]].ljust(COLUMN_FAILURE_SOURCE_WIDTH)  + COLUMN_SPACING
-      line += directory[:cause].ljust(COLUMN_FAILURE_SOURCE_WIDTH)            + COLUMN_SPACING
-      puts line
-    end
-
-    puts
-    puts "#{@failed_directories.length} errors"
-  end
-end
-
-# Each thread will receive its own directory_list and a common iteration_list
-def threaded_puts(message)
-  @mutex.synchronize {
-    puts message
-  }
-end
-
-##### Extract a value from a results file to be used in a control file
-def extract_value_from(keyword, source)
-  if not File.exist? source
-    return nil
-  end
-
-  extractor = /(?<==)\s*([^\s]*)/
-
-  File.open(source, "r") do |file|
-    file.each_line do |line|
-      if /#{keyword}/.match line
-        matches = extractor.match(line).captures
-        # TODO Act properly when matches.length != 1
-        if matches.any?
-          return matches.first
-        end
-      end
-    end
-  end
-  return nil
-end
-
-# Pretty-print a key/value pair for use in an iterative control file
-def format_option option, value
-  return "#{option.rjust(CONTROL_FILE_ALIGN)} = #{value}"
-end
-
-def make_filename(base, type)
-  if not base.is_a? String
-    base = base.to_s
-  end
-
-  case type
-  when :control
-    return FILE_ITERATION_PREFIX + base + FILE_CONTROL_SUFFIX
-  when :stdout
-    return FILE_ITERATION_PREFIX + base + FILE_STDOUT_SUFFIX
-  when :stderr
-    return FILE_ITERATION_PREFIX + base + FILE_STDERR_SUFFIX
-  end
-end
-
-def human_readable_time(seconds)
-  seconds = seconds.to_i
-  hours = seconds/3600
-  seconds %= 3600
-  minutes = seconds/60
-  seconds %= 60
-
-  return  hours.to_s.rjust(2,'0') + ":" + minutes.to_s.rjust(2,'0') + ":" +
-          seconds.to_s.rjust(2,'0')
-end
-
+Note: empty lines, comments and text to the right of an option will be passed without modification to the generated codeml control file.
+EOF
 
 # Start execution
 clarisse_main()

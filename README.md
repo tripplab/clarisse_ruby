@@ -1,5 +1,5 @@
-# Clarisse: wrapper for repeated and concurrent codeml execution
---------------------------------------------------
+Clarisse: wrapper for repeated and concurrent codeml execution
+==================================================
 
 Clarisse is a [Ruby](https://www.ruby-lang.org/en/) script that simplifies the repeated and parallel execution of [codeml](http://envgen.nox.ac.uk/bioinformatics/docs/codeml.html) over a large number of alignments. 
 
